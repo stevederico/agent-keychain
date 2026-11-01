@@ -99,8 +99,8 @@ pub fn write_request(w: &mut impl Write, req: &Request) -> io::Result<()> {
     match req {
         Request::List => w.write_all(b"LIST\n")?,
         Request::Log => w.write_all(b"LOG\n")?,
-        Request::Get(n) => write!(w, "GET {n}\n")?,
-        Request::Rm(n) => write!(w, "RM {n}\n")?,
+        Request::Get(n) => writeln!(w, "GET {n}")?,
+        Request::Rm(n) => writeln!(w, "RM {n}")?,
         Request::Set(n, v) => {
             write!(w, "SET {n}\n{}\n", v.len())?;
             w.write_all(v)?;
@@ -110,7 +110,7 @@ pub fn write_request(w: &mut impl Write, req: &Request) -> io::Result<()> {
 }
 
 pub fn write_ok(w: &mut impl Write, data: &[u8]) -> io::Result<()> {
-    write!(w, "OK {}\n", data.len())?;
+    writeln!(w, "OK {}", data.len())?;
     w.write_all(data)?;
     w.flush()
 }
@@ -122,7 +122,7 @@ pub fn write_denied(w: &mut impl Write) -> io::Result<()> {
 
 pub fn write_err(w: &mut impl Write, msg: &str) -> io::Result<()> {
     let msg: String = msg.chars().map(|c| if c.is_control() { ' ' } else { c }).take(200).collect();
-    write!(w, "ERR {msg}\n")?;
+    writeln!(w, "ERR {msg}")?;
     w.flush()
 }
 

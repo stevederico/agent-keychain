@@ -60,7 +60,7 @@ impl Vault {
     pub fn set(&mut self, name: &str, value: &[u8]) -> io::Result<()> {
         let mut nonce = [0u8; NONCE_LEN];
         crypto::random(&mut nonce)?;
-        let sealed = crypto::seal(&self.key, &nonce, &aad(name), value)?;
+        let sealed = crypto::seal(&self.key, &nonce, &aad(name), value);
         let old = self.entries.insert(name.to_string(), Entry { nonce, sealed });
         if let Err(e) = self.save() {
             match old {

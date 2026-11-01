@@ -1,5 +1,5 @@
 //! agent-keychain: a local keychain that gives AI agents a secret only after the user approves.
-//! Std only, no crates. Crypto is the kernel's (AF_ALG); approval is polkit's.
+//! Std only, no crates. Crypto is XChaCha20-Poly1305 ported from libsodium; approval is polkit's.
 
 pub mod crypto;
 pub mod names;

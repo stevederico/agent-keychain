@@ -3,6 +3,13 @@
 - Add install files
 - Add integration tests
 
+0.3.0
+
+  Port libsodium crypto
+  Add test vectors
+  Add libsodium cross-checks
+  Drop kernel crypto
+
 0.2.0
 
   Expand gitignore

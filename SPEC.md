@@ -35,10 +35,13 @@ The main threat is a program running as the user that reads secrets without aski
 ## Build rules
 
 - Rust, std only, zero crates (`[dependencies]` stays empty, `Cargo.lock` lists only this package)
-- No external libraries. Only the kernel, glibc (std already links it), and base-system tools (systemd, polkit)
-- Crypto: the Linux kernel's crypto API (`AF_ALG` sockets), never our own cipher code
-  - Cipher: `rfc7539(chacha20,poly1305)` AEAD, 12-byte nonce, 16-byte tag
+- No external libraries at runtime. Only glibc (std already links it) and base-system tools (systemd, polkit)
+- Crypto: XChaCha20-Poly1305 (IETF), ported line by line from libsodium 1.0.22 reference code (ISC, notice kept in `src/crypto.rs` and `LICENSES/libsodium.txt`)
+  - Not invented: same algorithms, same structure, same constant-time tag check
+  - Verified by RFC 8439 and draft-irtf-cfrg-xchacha test vectors
+  - Differential tests compare against system libsodium on thousands of random inputs (test builds only)
   - Randomness: `getrandom(2)`
+  - Why not the kernel's crypto API: Omarchy's kernel sets `crypto.af_alg_restrict = 1`, which blocks unprivileged use
 - Syscalls through hand-written `extern "C"` declarations against glibc
 - Peer credentials: `getsockopt(SO_PEERCRED)` (std's `peer_cred` is unstable)
 - Approval: run polkit's `pkcheck --allow-user-interaction`, no D-Bus crate
@@ -48,10 +51,10 @@ The main threat is a program running as the user that reads secrets without aski
 ## Storage and crypto
 
 - One vault file: `/var/lib/agent-keychain/vault`, mode 0600, owned by `agent-keychain`
-- Each secret sealed with ChaCha20-Poly1305 through `AF_ALG`, fresh random nonce per write, secret name as associated data
+- Each secret sealed with XChaCha20-Poly1305, fresh random 24-byte nonce per write, secret name as associated data
 - Vault key: random 32 bytes, kept sealed by `systemd-creds` (TPM2 when present, else host key), so no extra master password
-- Secrets held in `mlock`ed buffers, zeroed with volatile writes before free
-- No custom crypto. We call the kernel's implementation; we never write cipher code
+- Service runs with `MemorySwapMax=0`, so secrets never reach swap; buffers zeroed with volatile writes before free
+- No invented crypto: a faithful port of audited code, checked against the original
 
 ## CLI
 
