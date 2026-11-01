@@ -1,6 +1,11 @@
 - Test real polkit install
 - Consider 1-hour approval
 - Add proxy mode (agent never sees secret; plug into cloak/OneCLI or own TLS)
+- Add agent-browser login plugin (credential.read, agent never sees password)
+
+0.15.0
+
+  Plan login plugin
 
 0.14.0
 
