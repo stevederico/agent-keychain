@@ -7,6 +7,7 @@ An agent gets a secret only after you approve that one request with your login p
 - Linux only (built for Omarchy)
 - No account, no cloud, no sync
 - Zero-crate Rust: no dependencies, std only (`[dependencies]` is empty)
+- About 3.5K lines of Rust, tests included: small enough to read in an afternoon
 
 ## How it works
 
