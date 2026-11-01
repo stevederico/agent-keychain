@@ -2,6 +2,10 @@
 - Consider 1-hour approval
 - Add proxy mode (agent never sees secret; plug into cloak/OneCLI or own TLS)
 
+0.11.1
+
+  Fix with across users
+
 0.11.0
 
   Add with command

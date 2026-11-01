@@ -20,9 +20,17 @@ pub const SIGINT: c_int = 2;
 pub const SIGQUIT: c_int = 3;
 pub const SIGTERM: c_int = 15;
 pub const SIG_DFL: sighandler_t = 0;
+pub const POLLIN: i16 = 1;
 
 /// A handler address, or SIG_DFL.
 pub type sighandler_t = usize;
+
+#[repr(C)]
+pub struct pollfd {
+    pub fd: c_int,
+    pub events: i16,
+    pub revents: i16,
+}
 
 #[repr(C)]
 #[derive(Default)]
@@ -56,7 +64,7 @@ unsafe extern "C" {
     pub fn tcsetattr(fd: c_int, action: c_int, t: *const termios) -> c_int;
     pub fn signal(sig: c_int, handler: sighandler_t) -> sighandler_t;
     pub fn raise(sig: c_int) -> c_int;
-    pub fn pidfd_send_signal(pidfd: c_int, sig: c_int, info: *mut c_void, flags: c_uint) -> c_int;
+    pub fn poll(fds: *mut pollfd, nfds: u64, timeout: c_int) -> c_int;
 }
 
 #[cfg(test)]
@@ -67,5 +75,6 @@ mod tests {
     fn layouts_match_glibc() {
         assert_eq!(size_of::<ucred>(), 12);
         assert_eq!(size_of::<termios>(), 60);
+        assert_eq!(size_of::<pollfd>(), 8);
     }
 }

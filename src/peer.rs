@@ -48,11 +48,13 @@ pub fn peer_pidfd(fd: RawFd) -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(pidfd) })
 }
 
-/// Whether the process behind a pidfd still holds its pid (running or not yet reaped),
-/// so that pid cannot have been reused.
+/// Whether the process behind a pidfd is still running, so its pid cannot have been
+/// reused. A pidfd turns readable when its process exits. Unlike signal 0, this needs
+/// no permission over the process, which the daemon (another user) does not have.
 pub fn alive(pidfd: &OwnedFd) -> bool {
-    // SAFETY: signal 0 only checks; no pointer is passed.
-    unsafe { sys::pidfd_send_signal(pidfd.as_raw_fd(), 0, std::ptr::null_mut(), 0) == 0 }
+    let mut p = sys::pollfd { fd: pidfd.as_raw_fd(), events: sys::POLLIN, revents: 0 };
+    // SAFETY: `p` is one valid pollfd; a zero timeout returns at once.
+    unsafe { sys::poll(&mut p, 1, 0) == 0 }
 }
 
 /// (pid, start time) for `pid` and each ancestor below init, nearest first.
@@ -127,6 +129,12 @@ mod tests {
         assert_eq!(chain[0], (me, proc_stat(me).unwrap().1));
         assert!(chain.iter().all(|&(p, _)| p > 1));
         assert_eq!(chain, ancestry(me).unwrap(), "stable while nothing exits");
+    }
+
+    #[test]
+    fn pidfd_of_a_live_peer() {
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert!(alive(&peer_pidfd(a.as_raw_fd()).unwrap()));
     }
 
     #[test]
