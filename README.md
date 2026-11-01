@@ -1,6 +1,6 @@
 # agent-keychain
 
-A secret store for AI agents. **Runs local, no dependencies.**
+Secret store for agents. **Runs local, no dependencies. 3.5K LOC.**
 
 An agent gets a secret only after you approve that one request with your login password.
 
