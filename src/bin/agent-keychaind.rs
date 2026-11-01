@@ -37,6 +37,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(600);
 const USAGE: &str = "usage: agent-keychaind [--owner-uid UID] [--socket PATH] [--state-dir DIR]
                       [--key-file PATH] [--approver PROGRAM] [--deny-backoff SECS]
        agent-keychaind --gen-key   (print 32 random bytes, for systemd-creds)
+       agent-keychaind --version
 
 The owner uid may also come from AGENT_KEYCHAIN_OWNER_UID. Without --key-file the
 vault key is read from the systemd credential \"vault-key\".
@@ -74,6 +75,10 @@ fn parse_args() -> Result<Mode, String> {
         let mut value = || args.next().ok_or_else(|| format!("{arg} needs a value\n\n{USAGE}"));
         match arg.as_str() {
             "--gen-key" => return Ok(Mode::GenKey),
+            "-V" | "--version" => {
+                println!("agent-keychaind {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             "--socket" => socket = value()?.into(),
             "--state-dir" => state_dir = value()?.into(),
             "--key-file" => key_file = Some(value()?.into()),

@@ -33,6 +33,7 @@ commands:
   rm <name>    delete a secret (asks you to approve)
   log          show recent requests (--json for an array of objects)
   skill        print the guide for AI agents (start here if you are one)
+  --version    print the version
   scan [dir]   find secrets in plain files (.env, shell config, ~/.npmrc, ...).
                Read only; shows where, never the values. --json for scripts
   import <file>:<line>[=name]...
@@ -102,6 +103,10 @@ fn run() -> Result<ExitCode, String> {
         ["scan", rest @ ..] => return scan_cmd(rest),
         ["import", "--all"] => import_all()?,
         ["import", specs @ ..] if !specs.is_empty() => import(specs)?,
+        ["-V" | "--version" | "version"] => {
+            println!("agent-keychain {}", env!("CARGO_PKG_VERSION"));
+            return Ok(ExitCode::SUCCESS);
+        }
         ["skill"] => {
             print!("{SKILL}");
             return Ok(ExitCode::SUCCESS);

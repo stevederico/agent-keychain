@@ -399,6 +399,17 @@ fn skill_prints_agent_guide() {
 }
 
 #[test]
+fn version() {
+    let want = env!("CARGO_PKG_VERSION");
+    for (bin, flag) in [(CLIENT, "--version"), (CLIENT, "-V"), (DAEMON, "--version")] {
+        let out = Command::new(bin).arg(flag).output().unwrap();
+        assert!(out.status.success());
+        let text = String::from_utf8(out.stdout).unwrap();
+        assert!(text.trim_end().ends_with(want), "{text}");
+    }
+}
+
+#[test]
 fn gen_key_prints_32_random_bytes() {
     let a = Command::new(DAEMON).arg("--gen-key").output().unwrap();
     let b = Command::new(DAEMON).arg("--gen-key").output().unwrap();
