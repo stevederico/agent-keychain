@@ -269,6 +269,7 @@ fn respond(sh: &Shared, req: &Request, peer: &Peer, caller: &str, sock: RawFd, w
             ("listed", proto::write_ok(w, names.as_bytes()))
         }
         Request::Log => ("shown", proto::write_ok(w, &log_tail(&sh.cfg.state_dir.join("log")))),
+        Request::Version => ("shown", proto::write_ok(w, env!("CARGO_PKG_VERSION").as_bytes())),
         Request::Get(name) => {
             if !lock(&sh.vault).contains(name) {
                 return missing(w, name);

@@ -40,6 +40,8 @@ agent-keychain list              # names only (--json for scripts)
 agent-keychain rm github         # delete, needs approval
 agent-keychain log               # recent requests (--json for scripts)
 agent-keychain skill             # guide for AI agents: point your agent here
+agent-keychain doctor            # check the install (service, socket, versions, polkit)
+agent-keychain help with         # details for one command
 agent-keychain scan              # optional: find keys in plain files (.env, ~/.npmrc, ...)
 agent-keychain import ~/.npmrc:5 ~/proj/.env:2=github   # optional: store what scan found, one approval
 agent-keychain import --all      # optional: store everything scan finds
@@ -48,7 +50,7 @@ agent-keychain with github,npm --for 2h -- claude   # ask once, then no prompts 
 GITHUB_TOKEN=$(agent-keychain get github) gh pr list
 ```
 
-Exit codes: 0 ok, 1 error, 2 denied, 64 usage.
+Exit codes: 0 ok, 1 error, 2 denied, 64 usage. Add `--json` for JSON output and JSON errors (`{"error": ..., "code": ...}`); `get` always prints the raw value.
 
 ## Compared to other tools
 

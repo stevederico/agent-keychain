@@ -1,6 +1,6 @@
 //! Wire protocol over the Unix socket. One request and one response per connection.
 //!
-//! Request:  `LIST\n` | `LOG\n` | `GET <name>\n` | `RM <name>\n` | `SET <name>\n<len>\n<bytes>`
+//! Request:  `LIST\n` | `LOG\n` | `VERSION\n` | `GET <name>\n` | `RM <name>\n` | `SET <name>\n<len>\n<bytes>`
 //!           | `ALLOW <name>[,<name>...] <seconds>\n`
 //!           | `SETMANY <count>\n` then `<count>` times `<name>\n<len>\n<bytes>`
 //! Response: `OK <len>\n<bytes>` | `DENIED\n` | `ERR <message>\n`
@@ -21,6 +21,8 @@ pub const MAX_ALLOW_SECS: u64 = 12 * 3600;
 
 pub enum Request {
     List,
+    /// The daemon's version, so a client can spot a stale daemon.
+    Version,
     Log,
     Get(String),
     Rm(String),
@@ -36,6 +38,7 @@ impl Request {
     pub fn verb(&self) -> &'static str {
         match self {
             Request::List => "LIST",
+            Request::Version => "VERSION",
             Request::Log => "LOG",
             Request::Get(_) => "GET",
             Request::Rm(_) => "RM",
@@ -51,7 +54,7 @@ impl Request {
             | Request::Set(n, _)
             | Request::Allow(n, _)
             | Request::SetMany(n, _) => Some(n),
-            Request::List | Request::Log => None,
+            Request::List | Request::Log | Request::Version => None,
         }
     }
 }
@@ -108,6 +111,7 @@ pub fn read_request(r: &mut impl BufRead) -> io::Result<Request> {
     match (verb, name) {
         ("LIST", None) => Ok(Request::List),
         ("LOG", None) => Ok(Request::Log),
+        ("VERSION", None) => Ok(Request::Version),
         ("GET", n) => Ok(Request::Get(named(n)?)),
         ("RM", n) => Ok(Request::Rm(named(n)?)),
         ("ALLOW", Some(rest)) => {
@@ -155,6 +159,7 @@ pub fn write_request(w: &mut impl Write, req: &Request) -> io::Result<()> {
     match req {
         Request::List => w.write_all(b"LIST\n")?,
         Request::Log => w.write_all(b"LOG\n")?,
+        Request::Version => w.write_all(b"VERSION\n")?,
         Request::Get(n) => writeln!(w, "GET {n}")?,
         Request::Rm(n) => writeln!(w, "RM {n}")?,
         Request::Allow(list, secs) => writeln!(w, "ALLOW {list} {secs}")?,
@@ -221,6 +226,7 @@ mod tests {
     #[test]
     fn requests_roundtrip() {
         assert!(matches!(roundtrip(Request::List), Request::List));
+        assert!(matches!(roundtrip(Request::Version), Request::Version));
         assert!(matches!(roundtrip(Request::Get("github".into())), Request::Get(n) if n == "github"));
         match roundtrip(Request::Set("github".into(), SecretBytes::from_slice(b"a\nb"))) {
             Request::Set(n, v) => assert_eq!((n.as_str(), &v[..]), ("github", &b"a\nb"[..])),

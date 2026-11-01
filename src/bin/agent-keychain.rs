@@ -6,6 +6,7 @@ use agent_keychain::proto::{self, MAX_SECRET, Request, Response};
 use agent_keychain::scan;
 use agent_keychain::sys;
 use std::env;
+use std::fs;
 use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::raw::c_int;
@@ -23,32 +24,124 @@ const SKILL: &str = include_str!("../skill.md");
 const EXIT_DENIED: u8 = 2;
 const EXIT_USAGE: u8 = 64;
 
-const USAGE: &str = "usage: agent-keychain <command> [name]
-       agent-keychain with <name>[,<name>...] [--for 1h] [--] <program> [args...]
+const USAGE: &str = "usage: agent-keychain <command> [args] [--json]
+
+AI agents: run `agent-keychain skill` first.
 
 commands:
-  set <name>   store a secret, from stdin or a hidden prompt (asks you to approve)
-  get <name>   print a secret (asks you to approve)
-  list         list secret names (--json for a JSON array)
-  rm <name>    delete a secret (asks you to approve)
-  log          show recent requests (--json for an array of objects)
-  skill        print the guide for AI agents (start here if you are one)
-  --version    print the version
-  scan [dir]   find secrets in plain files (.env, shell config, ~/.npmrc, ...).
-               Read only; shows where, never the values. --json for scripts
-  import <file>:<line>[=name]...
-               store secrets that scan found, under one approval.
-               --all imports everything scan finds. Files are left as they are
-  with <names> <program>
-               run a program that may get these secrets without a prompt, along
-               with everything it starts, for 1h or --for (30m, 2h, at most 12h).
-               Asks you to approve once
+  get <name>          print a secret (asks you to approve)
+  set <name>          store a secret from stdin or a hidden prompt (asks you to approve)
+  rm <name>           delete a secret (asks you to approve)
+  list                list secret names
+  log                 show recent requests
+  with <names> <cmd>  run a program that may get these secrets without asking, for a while
+  scan [dir]          find secrets in plain files; never prints them
+  import <file>:<line>...
+                      store secrets that scan found, under one approval
+  doctor              check the install
+  skill               print the guide for AI agents
+  help <command>      details for one command
+  --version           print the version
 
-examples:
+--json: JSON output for list, log, scan, doctor, set, rm, import and --version,
+and errors as {\"error\": ..., \"code\": ...}. get always prints the raw value.
+
+example:
   GITHUB_TOKEN=$(agent-keychain get github) gh pr list
-  agent-keychain with github,npm --for 2h -- claude
 
 exit codes: 0 ok, 1 error, 2 denied, 64 usage";
+
+/// Per-command help: (command, text).
+const HELP: &[(&str, &str)] = &[
+    ("get", "usage: agent-keychain get <name>
+
+Prints the secret to stdout after you approve it in the password prompt. A newline is
+added only on a terminal, so use it inline:
+
+  GITHUB_TOKEN=$(agent-keychain get github) gh pr list
+
+Exit 2 if denied, 1 if there is no such secret or a recent denial is still cooling down."),
+    ("set", "usage: agent-keychain set <name>
+
+Stores a secret, read from stdin or a hidden prompt on a terminal. One trailing newline
+is dropped. Overwrites a secret of the same name. Needs approval.
+
+  agent-keychain set github
+  printf %s \"$TOKEN\" | agent-keychain set github"),
+    ("rm", "usage: agent-keychain rm <name>
+
+Deletes a secret. Needs approval."),
+    ("list", "usage: agent-keychain list [--json]
+
+Prints secret names, one per line, or a JSON array. Never prints values; never prompts."),
+    ("log", "usage: agent-keychain log [--json]
+
+Shows the last 50 requests: time, request, secret name, uid, pid, caller chain and
+outcome. Never values. --json gives an array of objects."),
+    ("with", "usage: agent-keychain with <name>[,<name>...] [--for 1h] [--] <program> [args...]
+
+Asks you once, then runs the program. It and everything it starts may get these secrets
+without a prompt until the time is up (default 1h, at most 12h: 90s, 30m, 2h) or it exits.
+Other secrets and other programs still ask.
+
+  agent-keychain with github,npm --for 2h -- claude"),
+    ("scan", "usage: agent-keychain scan [dir...] [--json]
+
+Finds secrets in plain files: .env files, shell config, ~/.npmrc, ~/.aws/credentials,
+~/.netrc, ~/.git-credentials, ~/.config/gh/hosts.yml, ~/.docker/config.json. Without a
+dir it scans your home. Read only. Prints file:line, variable, a preview (known prefix
+and last 4) and a suggested name; never the value."),
+    ("import", "usage: agent-keychain import <file>:<line>[=name]... | --all [--json]
+
+Stores secrets that scan found, all under one approval. =name picks the vault name.
+--all takes everything a home scan finds. Never overwrites a stored name and never
+edits the file: remove the plain copy yourself once nothing reads it.
+
+  agent-keychain import ~/.npmrc:5 ~/proj/.env:2=github"),
+    ("doctor", "usage: agent-keychain doctor [--json]
+
+Checks the install: which agent-keychain is first in PATH, the service, the socket,
+the daemon's version against this client's, the polkit policy and pkcheck.
+Exit 1 if any check fails."),
+    ("skill", "usage: agent-keychain skill
+
+Prints the guide for AI agents, built into this binary so it always matches."),
+];
+
+/// Set by --json, so errors print as JSON too.
+static JSON: AtomicBool = AtomicBool::new(false);
+
+fn json_mode() -> bool {
+    JSON.load(Ordering::Relaxed)
+}
+
+/// Prints a failure in the chosen format and returns its exit code.
+fn fail(msg: &str, code: u8) -> ExitCode {
+    if json_mode() {
+        println!("{{\"error\":{},\"code\":{code}}}", json_string(msg));
+    } else {
+        eprintln!("agent-keychain: {msg}");
+    }
+    ExitCode::from(code)
+}
+
+fn usage() -> Result<ExitCode, String> {
+    if json_mode() {
+        return Ok(fail("usage: see agent-keychain --help", EXIT_USAGE));
+    }
+    eprintln!("{USAGE}");
+    Ok(ExitCode::from(EXIT_USAGE))
+}
+
+fn help(cmd: &str) -> Result<ExitCode, String> {
+    match HELP.iter().find(|(c, _)| *c == cmd) {
+        Some((_, text)) => {
+            println!("{text}");
+            Ok(ExitCode::SUCCESS)
+        }
+        None => usage(),
+    }
+}
 
 fn socket_path() -> PathBuf {
     // Debug builds only, for tests. A release client always talks to the system daemon,
@@ -67,10 +160,7 @@ fn main() -> ExitCode {
     unsafe { sys::prctl(sys::PR_SET_DUMPABLE, 0 as std::os::raw::c_ulong) };
     match run() {
         Ok(code) => code,
-        Err(e) => {
-            eprintln!("agent-keychain: {e}");
-            ExitCode::FAILURE
-        }
+        Err(e) => fail(&e, 1),
     }
 }
 
@@ -85,14 +175,20 @@ fn name(s: &str) -> Result<String, String> {
 fn run() -> Result<ExitCode, String> {
     let mut os_args = env::args_os().skip(1);
     if os_args.next().is_some_and(|a| a == "with") {
-        return with(os_args.collect());
+        let rest: Vec<OsString> = os_args.collect();
+        if rest.first().is_some_and(|a| a == "--help" || a == "-h") {
+            return help("with");
+        }
+        return with(rest);
     }
-    let args: Vec<String> = env::args().skip(1).collect();
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let json = matches!(args.as_slice(), ["list" | "log", "--json"]);
+    let all: Vec<String> = env::args().skip(1).collect();
+    JSON.store(all.iter().any(|a| a == "--json"), Ordering::Relaxed);
+    let args: Vec<&str> = all.iter().map(String::as_str).filter(|a| *a != "--json").collect();
     let req = match args.as_slice() {
-        ["list"] | ["list", "--json"] => Request::List,
-        ["log"] | ["log", "--json"] => Request::Log,
+        [cmd, "--help" | "-h"] | ["help", cmd] => return help(cmd),
+        ["get", _] if json_mode() => return Ok(fail("get prints the raw value; use it inline without --json", EXIT_USAGE)),
+        ["list"] => Request::List,
+        ["log"] => Request::Log,
         ["get", n] => Request::Get(name(n)?),
         ["rm", n] => Request::Rm(name(n)?),
         ["set", n] => {
@@ -100,11 +196,17 @@ fn run() -> Result<ExitCode, String> {
             let value = read_secret(&n)?;
             Request::Set(n, value)
         }
-        ["scan", rest @ ..] => return scan_cmd(rest),
+        ["scan", dirs @ ..] => return scan_cmd(dirs),
+        ["doctor"] => return Ok(doctor()),
         ["import", "--all"] => import_all()?,
         ["import", specs @ ..] if !specs.is_empty() => import(specs)?,
         ["-V" | "--version" | "version"] => {
-            println!("agent-keychain {}", env!("CARGO_PKG_VERSION"));
+            let v = env!("CARGO_PKG_VERSION");
+            if json_mode() {
+                println!("{{\"version\":{}}}", json_string(v));
+            } else {
+                println!("agent-keychain {v}");
+            }
             return Ok(ExitCode::SUCCESS);
         }
         ["skill"] => {
@@ -115,23 +217,89 @@ fn run() -> Result<ExitCode, String> {
             println!("{USAGE}");
             return Ok(ExitCode::SUCCESS);
         }
-        _ => {
-            eprintln!("{USAGE}");
-            return Ok(ExitCode::from(EXIT_USAGE));
-        }
+        _ => return usage(),
     };
 
     match request(&req)? {
         Response::Ok(data) => {
-            print_ok(&req, &data, json).map_err(|e| e.to_string())?;
+            print_ok(&req, &data).map_err(|e| e.to_string())?;
             Ok(ExitCode::SUCCESS)
         }
-        Response::Denied => {
-            eprintln!("agent-keychain: denied");
-            Ok(ExitCode::from(EXIT_DENIED))
-        }
+        Response::Denied => Ok(fail("denied", EXIT_DENIED)),
         Response::Err(msg) => Err(msg),
     }
+}
+
+/// One doctor check: name, passed, detail.
+type Check = (&'static str, bool, String);
+
+/// Checks the install and prints a report. Exit 1 if anything failed.
+fn doctor() -> ExitCode {
+    let mut checks: Vec<Check> = Vec::new();
+    let me = env!("CARGO_PKG_VERSION");
+
+    // The agent-keychain an agent would run: an earlier one in PATH could fake the flow.
+    let exe = env::current_exe().ok().and_then(|p| p.canonicalize().ok());
+    let first = env::var_os("PATH").and_then(|path| {
+        env::split_paths(&path).map(|d| d.join("agent-keychain")).find(|p| p.is_file())
+    });
+    let first_real = first.as_ref().and_then(|p| p.canonicalize().ok());
+    checks.push(match &first {
+        None => ("path", false, "agent-keychain is not in PATH".into()),
+        Some(p) if first_real.as_deref() == Some(Path::new("/usr/bin/agent-keychain")) || first_real == exe => {
+            ("path", true, p.display().to_string())
+        }
+        Some(p) => ("path", false, format!("{} comes first in PATH, not /usr/bin/agent-keychain", p.display())),
+    });
+
+    let service = Command::new("systemctl").args(["is-active", "agent-keychaind"]).output();
+    checks.push(match service {
+        Ok(out) => {
+            let state = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let hint = if state == "active" { String::new() } else { " (run ./install.sh, or: sudo systemctl start agent-keychaind)".into() };
+            ("service", state == "active", format!("{state}{hint}"))
+        }
+        Err(e) => ("service", false, format!("cannot run systemctl: {e}")),
+    });
+
+    match request(&Request::Version) {
+        Ok(Response::Ok(v)) => {
+            let v = String::from_utf8_lossy(&v).into_owned();
+            checks.push(("socket", true, socket_path().display().to_string()));
+            let same = v == me;
+            let detail = if same { v } else { format!("daemon {v}, client {me}: rerun ./install.sh") };
+            checks.push(("daemon", same, detail));
+        }
+        Ok(Response::Err(_)) => {
+            checks.push(("socket", true, socket_path().display().to_string()));
+            checks.push(("daemon", false, format!("older than {me}: rerun ./install.sh")));
+        }
+        Ok(Response::Denied) => checks.push(("socket", false, "denied".into())),
+        Err(e) => checks.push(("socket", false, e)),
+    }
+
+    let policy = fs::read_to_string("/usr/share/polkit-1/actions/dev.agent-keychain.policy");
+    checks.push(match policy {
+        Ok(p) if p.contains("dev.agent-keychain.allow") => ("polkit policy", true, "installed".into()),
+        Ok(_) => ("polkit policy", false, "outdated: rerun ./install.sh".into()),
+        Err(e) => ("polkit policy", false, format!("missing ({e}): run ./install.sh")),
+    });
+    let pkcheck = Path::new("/usr/bin/pkcheck").is_file();
+    checks.push(("pkcheck", pkcheck, if pkcheck { "/usr/bin/pkcheck".into() } else { "missing: install polkit".into() }));
+
+    let ok = checks.iter().all(|(_, pass, _)| *pass);
+    if json_mode() {
+        let items: Vec<String> = checks
+            .iter()
+            .map(|(c, pass, d)| format!("{{\"check\":{},\"ok\":{pass},\"detail\":{}}}", json_string(c), json_string(d)))
+            .collect();
+        println!("[{}]", items.join(","));
+    } else {
+        for (c, pass, d) in &checks {
+            println!("{}  {c:<14} {d}", if *pass { "ok  " } else { "FAIL" });
+        }
+    }
+    if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 
 fn request(req: &Request) -> Result<Response, String> {
@@ -198,15 +366,19 @@ fn parse_duration(s: &str) -> Result<u64, String> {
     }
 }
 
-fn print_ok(req: &Request, data: &[u8], json: bool) -> io::Result<()> {
+fn print_ok(req: &Request, data: &[u8]) -> io::Result<()> {
     let mut out = io::stdout().lock();
-    if json {
+    if json_mode() {
         let text = String::from_utf8_lossy(data);
-        let items: Vec<String> = match req {
-            Request::List => text.lines().map(json_string).collect(),
-            _ => text.lines().map(log_json).collect(),
-        };
-        writeln!(out, "[{}]", items.join(","))?;
+        let list = |names: &str| names.split(',').map(json_string).collect::<Vec<_>>().join(",");
+        match req {
+            Request::List => writeln!(out, "[{}]", text.lines().map(json_string).collect::<Vec<_>>().join(","))?,
+            Request::Log => writeln!(out, "[{}]", text.lines().map(log_json).collect::<Vec<_>>().join(","))?,
+            Request::Set(n, _) | Request::SetMany(n, _) => writeln!(out, "{{\"stored\":[{}]}}", list(n))?,
+            Request::Rm(n) => writeln!(out, "{{\"removed\":{}}}", json_string(n))?,
+            Request::Version => writeln!(out, "{{\"version\":{}}}", json_string(&text))?,
+            Request::Get(_) | Request::Allow(..) => {}
+        }
         return out.flush();
     }
     match req {
@@ -216,7 +388,7 @@ fn print_ok(req: &Request, data: &[u8], json: bool) -> io::Result<()> {
                 out.write_all(b"\n")?;
             }
         }
-        Request::List | Request::Log => {
+        Request::List | Request::Log | Request::Version => {
             out.write_all(data)?;
             if !data.is_empty() {
                 out.write_all(b"\n")?;
@@ -254,9 +426,8 @@ fn untilde(s: &str) -> Result<PathBuf, String> {
     }
 }
 
-fn scan_cmd(args: &[&str]) -> Result<ExitCode, String> {
-    let json = args.contains(&"--json");
-    let dirs: Vec<&str> = args.iter().copied().filter(|a| *a != "--json").collect();
+fn scan_cmd(dirs: &[&str]) -> Result<ExitCode, String> {
+    let json = json_mode();
     let files = if dirs.is_empty() {
         scan::home_files(&home()?)
     } else {

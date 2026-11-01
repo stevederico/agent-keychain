@@ -32,6 +32,8 @@ GITHUB_TOKEN=$(agent-keychain get github) gh pr list
 
 Never retry a denied or throttled request in a loop.
 
+Add `--json` to get errors as `{"error": "...", "code": 2}` (not for `get`, which always prints the raw value). If nothing works, run `agent-keychain doctor` and show the user its output.
+
 ## Many requests
 
 If a task needs the same secret many times, ask the user to start you with:

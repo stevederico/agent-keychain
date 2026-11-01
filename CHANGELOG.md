@@ -2,6 +2,14 @@
 - Add agent-browser login plugin (credential.read, agent never sees password)
 - Add Mac support (Authorization Services, launchd, Keychain, libproc, LOCAL_PEERCRED/audit token, getentropy, PT_DENY_ATTACH, macOS struct layouts in sys.rs)
 
+0.22.0
+
+  Add doctor command
+  Add per-command help
+  Add JSON errors
+  Add daemon version request
+  Point agents to skill
+
 0.21.0
 
   Add --version

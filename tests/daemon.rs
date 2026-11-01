@@ -399,6 +399,43 @@ fn skill_prints_agent_guide() {
 }
 
 #[test]
+fn help() {
+    let run = |args: &[&str]| summarize(Command::new(CLIENT).args(args).output().unwrap());
+    let (code, out, _) = run(&["--help"]);
+    assert_eq!(code, 0);
+    assert!(out.contains("AI agents: run `agent-keychain skill` first"), "{out}");
+    for args in [&["help", "get"][..], &["get", "--help"], &["get", "-h"]] {
+        let (code, out, _) = run(args);
+        assert_eq!((code, out.starts_with("usage: agent-keychain get <name>")), (0, true), "{args:?}: {out}");
+    }
+    assert!(run(&["with", "--help"]).1.starts_with("usage: agent-keychain with"));
+    assert!(run(&["help", "doctor"]).1.contains("Checks the install"));
+    assert_eq!(run(&["help", "nope"]).0, 64);
+}
+
+#[test]
+fn json_everywhere() {
+    let mut env = Env::new("json");
+    env.start(current_uid());
+    assert_eq!(env.client(&["set", "x", "--json"], b"v1"), (0, "{\"stored\":[\"x\"]}\n".into(), String::new()));
+    assert_eq!(env.client(&["--version", "--json"], b"").1, format!("{{\"version\":\"{}\"}}\n", env!("CARGO_PKG_VERSION")));
+    assert_eq!(env.client(&["rm", "nope", "--json"], b""), (1, "{\"error\":\"no secret named nope\",\"code\":1}\n".into(), String::new()));
+    assert_eq!(env.client(&["get", "x", "--json"], b"").0, 64, "get never wraps the value");
+    fs::write(env.path("deny"), "").unwrap();
+    assert_eq!(env.client(&["rm", "x", "--json"], b"").1, "{\"error\":\"denied\",\"code\":2}\n");
+    fs::remove_file(env.path("deny")).unwrap();
+    assert_eq!(env.client(&["rm", "x", "--json"], b"").1, "{\"removed\":\"x\"}\n");
+
+    // doctor talks to this daemon; service and policy depend on the machine, so only
+    // the socket and version checks are asserted.
+    let (_, out, _) = env.client(&["doctor", "--json"], b"");
+    assert!(out.contains("{\"check\":\"socket\",\"ok\":true"), "{out}");
+    assert!(out.contains(&format!("{{\"check\":\"daemon\",\"ok\":true,\"detail\":\"{}\"}}", env!("CARGO_PKG_VERSION"))), "{out}");
+    let (_, out, _) = env.client(&["doctor"], b"");
+    assert!(out.lines().any(|l| l.starts_with("ok") && l.contains("daemon")), "{out}");
+}
+
+#[test]
 fn version() {
     let want = env!("CARGO_PKG_VERSION");
     for (bin, flag) in [(CLIENT, "--version"), (CLIENT, "-V"), (DAEMON, "--version")] {
