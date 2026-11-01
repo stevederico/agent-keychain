@@ -1,6 +1,8 @@
 # agent-keychain
 
-A local secret store that gives an AI agent a secret only after you approve that one request with your login password.
+A secret store for AI agents. **Runs local, no dependencies.**
+
+An agent gets a secret only after you approve that one request with your login password.
 
 - Linux only (built for Omarchy)
 - No account, no cloud, no sync
