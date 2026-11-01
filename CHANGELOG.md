@@ -3,6 +3,10 @@
 - Add install files
 - Add integration tests
 
+0.2.0
+
+  Expand gitignore
+
 0.1.0
 
   Add spec

@@ -1,1 +1,25 @@
-/target
+# Build output
+/target/
+
+# Secrets and vault data: never commit
+vault
+vault.tmp
+*.vault-key
+*.cred
+*.key
+.env
+.env.*
+
+# Test and debug leftovers
+*.sock
+core
+core.*
+*.profraw
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
