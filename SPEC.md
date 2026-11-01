@@ -21,7 +21,7 @@ The main threat is a program running as the user that reads secrets without aski
 | An agent pretends to be another agent | Partly | The caller's uid and pid come from the kernel (`SO_PEERCRED`), but its name comes from `/proc/<pid>/comm`, which any process can set |
 | An agent wears the user down with repeated prompts | Yes | One prompt at a time; after a denial, no prompts for 30s, doubling per denial in a row up to 10 min |
 | An agent draws a fake password prompt to phish the login password | No | Any app can draw a lookalike window. Only type the password into the real polkit prompt |
-| An agent reads a secret handed to another process | Partly | A process running as the user can read another's `/proc/<pid>/environ` and open its pipes and files through `/proc/<pid>/fd`, so `TOKEN=$(agent-keychain get x) cmd` exposes the token to any other agent of that user. The client itself is non-dumpable, which closes its own `/proc` entries, but the shell and the command that receive the secret stay readable. Handing the secret over by file descriptor does not help: those are readable the same way. The fix is isolation: run each agent in its own PID namespace (see below) |
+| An agent reads a secret handed to another process | Partly | A process running as the user can read another's `/proc/<pid>/environ` and open its pipes and files through `/proc/<pid>/fd`, so `TOKEN=$(agent-keychain get x) cmd` exposes the token to any other agent of that user. The client itself is non-dumpable, which closes its own `/proc` entries, but the shell and the command that receive the secret stay readable. Handing the secret over by file descriptor does not help: those are readable the same way. The fix is isolation: start each agent with `agent-keychain run` (see below) |
 | An agent puts a fake `agent-keychain` earlier in `PATH` | No | Pairs with the fake prompt above. Call `/usr/bin/agent-keychain` by full path |
 | An agent leaks a secret after it gets it | No | Out of scope: approval controls who gets a key, not what they do with it |
 | Root, or a hacked kernel | No | Root can read anything |
@@ -70,6 +70,7 @@ The main threat is a program running as the user that reads secrets without aski
 | `agent-keychain list` | Names only, never values |
 | `agent-keychain rm github` | Delete a secret. Needs approval |
 | `agent-keychain log` | Show recent requests |
+| `agent-keychain run claude` | Start an agent that cannot see the user's other processes |
 
 Agent use: `GITHUB_TOKEN=$(agent-keychain get github) gh pr list`
 
@@ -86,11 +87,7 @@ Agent use: `GITHUB_TOKEN=$(agent-keychain get github) gh pr list`
 
 ## Running agents in isolation
 
-Same-user agents can read each other's processes. Start each agent in its own PID namespace, so `/proc` shows only its own processes:
-
-```
-bwrap --dev-bind / / --unshare-pid --proc /proc claude
-```
+Same-user agents can read each other's processes. `agent-keychain run claude` starts the agent in its own PID namespace, so `/proc` shows only its own processes. It runs `/usr/bin/bwrap --dev-bind / / --unshare-pid --proc /proc -- claude` (bubblewrap, by full path so `PATH` cannot swap it).
 
 The agent keeps the user's files and network; it only loses sight of other processes. `agent-keychain get` still works inside: the kernel reports the caller's pid in the daemon's namespace.
 

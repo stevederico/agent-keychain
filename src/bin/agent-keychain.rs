@@ -5,19 +5,23 @@ use agent_keychain::names::valid_name;
 use agent_keychain::proto::{self, MAX_SECRET, Request, Response};
 use agent_keychain::sys;
 use std::env;
+use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::raw::c_int;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::process::ExitCode;
+use std::os::unix::process::CommandExt;
+use std::process::{Command, ExitCode};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const SOCKET: &str = "/run/agent-keychain/sock";
+const BWRAP: &str = "/usr/bin/bwrap";
 const EXIT_DENIED: u8 = 2;
 const EXIT_USAGE: u8 = 64;
 
 const USAGE: &str = "usage: agent-keychain <command> [name]
+       agent-keychain run [--] <program> [args...]
 
 commands:
   set <name>   store a secret, from stdin or a hidden prompt (asks you to approve)
@@ -25,9 +29,12 @@ commands:
   list         list secret names
   rm <name>    delete a secret (asks you to approve)
   log          show recent requests
+  run <cmd>    start an agent where it cannot see your other processes,
+               so it cannot read secrets handed to them (needs bubblewrap)
 
-example:
+examples:
   GITHUB_TOKEN=$(agent-keychain get github) gh pr list
+  agent-keychain run claude
 
 exit codes: 0 ok, 1 error, 2 denied, 64 usage";
 
@@ -64,6 +71,10 @@ fn name(s: &str) -> Result<String, String> {
 }
 
 fn run() -> Result<ExitCode, String> {
+    let mut os_args = env::args_os().skip(1);
+    if os_args.next().is_some_and(|a| a == "run") {
+        return isolate(os_args.collect());
+    }
     let args: Vec<String> = env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let req = match args.as_slice() {
@@ -105,6 +116,24 @@ fn run() -> Result<ExitCode, String> {
         }
         Response::Err(msg) => Err(msg),
     }
+}
+
+/// Replaces this process with `cmd` in a new PID namespace. Its /proc shows only its
+/// own processes, so it cannot read the environment or file descriptors of the user's
+/// other processes. Files, network and the terminal stay as they are.
+fn isolate(mut cmd: Vec<OsString>) -> Result<ExitCode, String> {
+    if cmd.first().is_some_and(|a| a == "--") {
+        cmd.remove(0);
+    }
+    if cmd.is_empty() {
+        eprintln!("{USAGE}");
+        return Ok(ExitCode::from(EXIT_USAGE));
+    }
+    let err = Command::new(BWRAP)
+        .args(["--dev-bind", "/", "/", "--unshare-pid", "--proc", "/proc", "--"])
+        .args(&cmd)
+        .exec();
+    Err(format!("cannot start {BWRAP}: {err} (is bubblewrap installed?)"))
 }
 
 fn print_ok(req: &Request, data: &[u8]) -> io::Result<()> {

@@ -1,6 +1,10 @@
 - Test real polkit install
 - Consider 1-hour approval
 
+0.8.0
+
+  Add run command
+
 0.7.0
 
   Hide client from /proc

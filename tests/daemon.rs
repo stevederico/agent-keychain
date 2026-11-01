@@ -218,6 +218,28 @@ fn one_prompt_at_a_time() {
 }
 
 #[test]
+fn run_hides_other_processes() {
+    if !Path::new("/usr/bin/bwrap").exists() {
+        eprintln!("skipped: no /usr/bin/bwrap");
+        return;
+    }
+    let mut env = Env::new("run");
+    env.start(current_uid());
+    assert_eq!(env.client(&["set", "github"], b"tok").0, 0);
+
+    let daemon = env.daemon.as_ref().unwrap().id();
+    let script = format!("echo $$; [ -e /proc/{daemon} ] && echo daemon visible; true");
+    let (code, out, err) = env.client(&["run", "--", "sh", "-c", &script], b"");
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out, "2\n", "pid 2 under bwrap, nothing else in sight");
+
+    // Secrets still work from inside.
+    let (code, out, err) = env.client(&["run", CLIENT, "get", "github"], b"");
+    assert_eq!((code, out.as_str()), (0, "tok"), "{err}");
+    assert_eq!(env.client(&["run"], b"").0, 64);
+}
+
+#[test]
 fn wrong_key_refuses_to_start() {
     let mut env = Env::new("wrongkey");
     env.start(current_uid());
