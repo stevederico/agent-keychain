@@ -9,7 +9,8 @@ use agent_keychain::{sys, time};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
-use std::os::fd::AsRawFd;
+use std::collections::HashMap;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::raw::c_ulong;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -25,6 +26,7 @@ const CREDENTIAL_NAME: &str = "vault-key";
 const PKCHECK: &str = "/usr/bin/pkcheck";
 const ACTION_READ: &str = "dev.agent-keychain.read";
 const ACTION_WRITE: &str = "dev.agent-keychain.write";
+const ACTION_ALLOW: &str = "dev.agent-keychain.allow";
 const LOG_TAIL: usize = 50;
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_BACKOFF_SECS: u64 = 30;
@@ -134,6 +136,7 @@ fn run() -> Result<(), String> {
         log: Mutex::new(log),
         prompt: Mutex::new(()),
         backoff: Mutex::new(Backoff::default()),
+        grants: Mutex::new(HashMap::new()),
     });
     for conn in listener.incoming() {
         match conn {
@@ -172,6 +175,14 @@ struct Shared {
     /// user is not left guessing which request a prompt belongs to.
     prompt: Mutex<()>,
     backoff: Mutex<Backoff>,
+    /// ALLOW grants, keyed by the granted process's (pid, start time).
+    grants: Mutex<HashMap<(i32, u64), Grant>>,
+}
+
+/// Secrets a process and its descendants may `get` without a prompt, until a deadline.
+struct Grant {
+    names: Vec<String>,
+    until: Instant,
 }
 
 /// After a denial, no prompts for a while, doubling with each denial in a row, so an
@@ -222,7 +233,7 @@ fn serve(sh: &Shared, stream: &UnixStream) -> io::Result<()> {
         }
     };
     // Log even when the reply could not be sent: the outcome happened either way.
-    let (outcome, sent) = respond(sh, &req, &peer, &caller, &mut w);
+    let (outcome, sent) = respond(sh, &req, &peer, &caller, stream.as_raw_fd(), &mut w);
     record(sh, req.verb(), req.name().unwrap_or("-"), &peer, &caller, outcome);
     sent
 }
@@ -230,7 +241,7 @@ fn serve(sh: &Shared, stream: &UnixStream) -> io::Result<()> {
 /// The outcome to log, and whether the reply reached the client.
 type Reply = (&'static str, io::Result<()>);
 
-fn respond(sh: &Shared, req: &Request, peer: &Peer, caller: &str, w: &mut impl Write) -> Reply {
+fn respond(sh: &Shared, req: &Request, peer: &Peer, caller: &str, sock: RawFd, w: &mut impl Write) -> Reply {
     match req {
         Request::List => {
             let names = lock(&sh.vault).names().collect::<Vec<_>>().join("\n");
@@ -241,19 +252,20 @@ fn respond(sh: &Shared, req: &Request, peer: &Peer, caller: &str, w: &mut impl W
             if !lock(&sh.vault).contains(name) {
                 return missing(w, name);
             }
-            if let Some(refused) = gate(sh, ACTION_READ, name, caller, peer, w) {
+            let by_grant = granted(sh, sock, peer.pid, name);
+            if !by_grant && let Some(refused) = gate(sh, ACTION_READ, name, "", caller, peer, w) {
                 return refused;
             }
             // Read after approval: the value may have changed while the prompt was up.
             let value = lock(&sh.vault).get(name);
             match value {
-                Ok(Some(v)) => ("allowed", proto::write_ok(w, &v)),
+                Ok(Some(v)) => (if by_grant { "allowed-by-grant" } else { "allowed" }, proto::write_ok(w, &v)),
                 Ok(None) => missing(w, name),
                 Err(e) => ("error", proto::write_err(w, &format!("cannot open {name}: {e}"))),
             }
         }
         Request::Set(name, value) => {
-            if let Some(refused) = gate(sh, ACTION_WRITE, name, caller, peer, w) {
+            if let Some(refused) = gate(sh, ACTION_WRITE, name, "", caller, peer, w) {
                 return refused;
             }
             let saved = lock(&sh.vault).set(name, value);
@@ -266,7 +278,7 @@ fn respond(sh: &Shared, req: &Request, peer: &Peer, caller: &str, w: &mut impl W
             if !lock(&sh.vault).contains(name) {
                 return missing(w, name);
             }
-            if let Some(refused) = gate(sh, ACTION_WRITE, name, caller, peer, w) {
+            if let Some(refused) = gate(sh, ACTION_WRITE, name, "", caller, peer, w) {
                 return refused;
             }
             let removed = lock(&sh.vault).remove(name);
@@ -277,6 +289,56 @@ fn respond(sh: &Shared, req: &Request, peer: &Peer, caller: &str, w: &mut impl W
                 Err(e) => ("error", proto::write_err(w, &format!("cannot save: {e}"))),
             }
         }
+        Request::Allow(list, secs) => {
+            let absent = {
+                let vault = lock(&sh.vault);
+                list.split(',').find(|n| !vault.contains(n)).map(str::to_string)
+            };
+            if let Some(name) = absent {
+                return missing(w, &name);
+            }
+            let Some(chain) = verified_ancestry(sock, peer.pid) else {
+                return ("error", proto::write_err(w, "cannot identify the asking process"));
+            };
+            if let Some(refused) = gate(sh, ACTION_ALLOW, list, &duration(*secs), caller, peer, w) {
+                return refused;
+            }
+            let names = list.split(',').map(str::to_string).collect();
+            let until = Instant::now() + Duration::from_secs(*secs);
+            lock(&sh.grants).insert(chain[0], Grant { names, until });
+            ("approved", proto::write_ok(w, b""))
+        }
+    }
+}
+
+/// Whether the asking process, or one of its ancestors, holds a live grant for `name`.
+fn granted(sh: &Shared, sock: RawFd, pid: i32, name: &str) -> bool {
+    let mut grants = lock(&sh.grants);
+    let now = Instant::now();
+    grants.retain(|_, g| g.until > now);
+    if grants.is_empty() {
+        return false;
+    }
+    let Some(chain) = verified_ancestry(sock, pid) else { return false };
+    chain.iter().any(|id| grants.get(id).is_some_and(|g| g.names.iter().any(|n| n == name)))
+}
+
+/// The asking process and its ancestors as (pid, start time), read twice and compared,
+/// with the asker confirmed alive through its pidfd. Without these checks, a process that
+/// exits mid-request could leave its pid, or a parent's, to a process holding a grant.
+fn verified_ancestry(sock: RawFd, pid: i32) -> Option<Vec<(i32, u64)>> {
+    let pidfd = peer::peer_pidfd(sock).ok()?;
+    let first = peer::ancestry(pid).ok()?;
+    let again = peer::ancestry(pid).ok()?;
+    (!first.is_empty() && first == again && peer::alive(&pidfd)).then_some(first)
+}
+
+/// 3600 -> "1h", 90 -> "90s", for the prompt.
+fn duration(secs: u64) -> String {
+    match secs {
+        s if s % 3600 == 0 => format!("{}h", s / 3600),
+        s if s % 60 == 0 => format!("{}m", s / 60),
+        s => format!("{s}s"),
     }
 }
 
@@ -285,7 +347,15 @@ fn missing(w: &mut impl Write, name: &str) -> Reply {
 }
 
 /// Asks for approval. None when approved; otherwise the refusal already sent.
-fn gate(sh: &Shared, action: &str, name: &str, caller: &str, peer: &Peer, w: &mut impl Write) -> Option<Reply> {
+fn gate(
+    sh: &Shared,
+    action: &str,
+    name: &str,
+    duration: &str,
+    caller: &str,
+    peer: &Peer,
+    w: &mut impl Write,
+) -> Option<Reply> {
     if let Some(wait) = lock(&sh.backoff).remaining() {
         let msg = format!("a recent request was denied; try again in {}s", wait.as_secs() + 1);
         return Some(("throttled", proto::write_err(w, &msg)));
@@ -298,7 +368,7 @@ fn gate(sh: &Shared, action: &str, name: &str, caller: &str, peer: &Peer, w: &mu
             return Some(("busy", proto::write_err(w, msg)));
         }
     };
-    match ask(sh, action, name, caller, peer) {
+    match ask(sh, action, name, duration, caller, peer) {
         Ok(true) => {
             lock(&sh.backoff).approved();
             None
@@ -315,7 +385,7 @@ fn gate(sh: &Shared, action: &str, name: &str, caller: &str, peer: &Peer, w: &mu
 }
 
 /// Ok(true) approved, Ok(false) denied, Err when no decision could be made.
-fn ask(sh: &Shared, action: &str, name: &str, caller: &str, peer: &Peer) -> io::Result<bool> {
+fn ask(sh: &Shared, action: &str, name: &str, duration: &str, caller: &str, peer: &Peer) -> io::Result<bool> {
     let (program, status) = match &sh.cfg.approver {
         Some(program) => (
             program.display().to_string(),
@@ -324,7 +394,11 @@ fn ask(sh: &Shared, action: &str, name: &str, caller: &str, peer: &Peer) -> io::
         None => {
             // pid + start time + uid pins the subject, so a reused pid cannot inherit the answer.
             let (_, start) = peer::proc_stat(peer.pid)?;
-            let status = Command::new(PKCHECK)
+            let mut pkcheck = Command::new(PKCHECK);
+            if !duration.is_empty() {
+                pkcheck.args(["--detail", "duration", duration]);
+            }
+            let status = pkcheck
                 .args(["--action-id", action])
                 .args(["--process", &format!("{},{},{}", peer.pid, start, peer.uid)])
                 .arg("--allow-user-interaction")

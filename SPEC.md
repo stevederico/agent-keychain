@@ -21,7 +21,8 @@ The main threat is a program running as the user that reads secrets without aski
 | An agent pretends to be another agent | Partly | The caller's uid and pid come from the kernel (`SO_PEERCRED`), but its name comes from `/proc/<pid>/comm`, which any process can set |
 | An agent wears the user down with repeated prompts | Yes | One prompt at a time; after a denial, no prompts for 30s, doubling per denial in a row up to 10 min |
 | An agent draws a fake password prompt to phish the login password | No | Any app can draw a lookalike window. Only type the password into the real polkit prompt |
-| An agent reads a secret handed to another process | Partly | A process running as the user can read another's `/proc/<pid>/environ` and open its pipes and files through `/proc/<pid>/fd`, so `TOKEN=$(agent-keychain get x) cmd` exposes the token to any other agent of that user. The client itself is non-dumpable, which closes its own `/proc` entries, but the shell and the command that receive the secret stay readable. Handing the secret over by file descriptor does not help: those are readable the same way. The fix is isolation: start each agent with `agent-keychain run` (see below) |
+| An agent reads a secret handed to another process | Partly | A process running as the user can read another's `/proc/<pid>/environ` and open its pipes and files through `/proc/<pid>/fd`, so `TOKEN=$(agent-keychain get x) cmd` exposes the token to any other agent of that user. The client itself is non-dumpable, which closes its own `/proc` entries, but the shell and the command that receive the secret stay readable. Handing the secret over by file descriptor does not help: those are readable the same way. The fix is isolation: run agents in their own sandbox (Claude Code and Codex both offer one, using bubblewrap on Linux) |
+| A granted program uses a secret without the user seeing a prompt | By design | Only after `with` was approved, only for the secrets and time named in that prompt, at most 12h |
 | An agent puts a fake `agent-keychain` earlier in `PATH` | No | Pairs with the fake prompt above. Call `/usr/bin/agent-keychain` by full path |
 | An agent leaks a secret after it gets it | No | Out of scope: approval controls who gets a key, not what they do with it |
 | Root, or a hacked kernel | No | Root can read anything |
@@ -70,7 +71,7 @@ The main threat is a program running as the user that reads secrets without aski
 | `agent-keychain list` | Names only, never values |
 | `agent-keychain rm github` | Delete a secret. Needs approval |
 | `agent-keychain log` | Show recent requests |
-| `agent-keychain run claude` | Start an agent that cannot see the user's other processes |
+| `agent-keychain with github --for 2h -- claude` | Run a program that may `get` these secrets without a prompt. Asks once |
 
 Agent use: `GITHUB_TOKEN=$(agent-keychain get github) gh pr list`
 
@@ -80,22 +81,20 @@ Agent use: `GITHUB_TOKEN=$(agent-keychain get github) gh pr list`
 - **Deny**: the client exits 2 and prints nothing
 - Log line: time, request, secret name, uid, pid, caller chain, outcome. Never values
 - Logged: every request, including `list`, `log`, other users' refused connections and malformed requests
-- Outcomes: `allowed`, `stored`, `removed`, `listed`, `shown`, `denied`, `missing`, `error` (approval could not run), `busy`, `throttled`, `refused`, `malformed`
+- Outcomes: `allowed`, `allowed-by-grant`, `approved` (a `with` grant), `stored`, `removed`, `listed`, `shown`, `denied`, `missing`, `error` (approval could not run), `busy`, `throttled`, `refused`, `malformed`
 - **One at a time**: while a prompt is open, other requests that need approval fail at once (`busy`) instead of queueing
 - **Backoff**: after a denial, requests that need approval fail without a prompt (`throttled`) for 30s (`--deny-backoff`), doubling per denial in a row up to 10 min. Any approval resets it. `list` and `log` are never held back
-- Not built yet: "approve for 1 hour"
-
-## Running agents in isolation
-
-Same-user agents can read each other's processes. `agent-keychain run claude` starts the agent in its own PID namespace, so `/proc` shows only its own processes. It runs `/usr/bin/bwrap --dev-bind / / --unshare-pid --proc /proc -- claude` (bubblewrap, by full path so `PATH` cannot swap it).
-
-The agent keeps the user's files and network; it only loses sight of other processes. `agent-keychain get` still works inside: the kernel reports the caller's pid in the daemon's namespace.
+- **With**: `agent-keychain with github,npm --for 2h -- claude` asks once (`"..." wants "github,npm" without asking, for 2h`), then execs the program
+  - The program and everything it starts may `get` those secrets without a prompt until the time is up (default 1h, at most 12h) or the program exits
+  - The grant is tied to the program's pid and start time. A request matches if that process is the asker or one of its ancestors, read from the kernel's parent links in `/proc/<pid>/stat`, which a process cannot fake
+  - The ancestry is read twice and compared, and the asker is confirmed alive through its pidfd (`SO_PEERPIDFD`), so a pid freed and reused mid-request cannot borrow a grant
+  - Only `get`. `set` and `rm` always prompt. Other secrets and other programs still prompt
+  - Grants live in the daemon's memory only; a restart drops them
 
 ## Open questions
 
 - Can the polkit prompt show which secret and caller is asking, clearly enough to trust? Omarchy's shell polkit agent shows the action message, which carries both, if polkit accepts the details (see the owner annotation below)
 - Proxy mode: hand the agent a placeholder and swap in the real secret on its outgoing HTTPS requests, so the agent never holds it. Needs TLS (breaks the zero-crate rule or means a port) or plugging into an existing proxy (cloak, OneCLI, Infisical Agent Vault)
-- Add "approve for 1 hour", or keep always-prompt?
 - Confirm on a real install: polkit honors the `org.freedesktop.policykit.owner` annotation for the daemon user
 - Packaging: a PKGBUILD for omarchy-pkgs, or local only?
 

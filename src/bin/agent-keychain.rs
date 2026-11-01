@@ -16,12 +16,12 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const SOCKET: &str = "/run/agent-keychain/sock";
-const BWRAP: &str = "/usr/bin/bwrap";
+const DEFAULT_ALLOW_SECS: u64 = 3600;
 const EXIT_DENIED: u8 = 2;
 const EXIT_USAGE: u8 = 64;
 
 const USAGE: &str = "usage: agent-keychain <command> [name]
-       agent-keychain run [--] <program> [args...]
+       agent-keychain with <name>[,<name>...] [--for 1h] [--] <program> [args...]
 
 commands:
   set <name>   store a secret, from stdin or a hidden prompt (asks you to approve)
@@ -29,12 +29,14 @@ commands:
   list         list secret names
   rm <name>    delete a secret (asks you to approve)
   log          show recent requests
-  run <cmd>    start an agent where it cannot see your other processes,
-               so it cannot read secrets handed to them (needs bubblewrap)
+  with <names> <program>
+               run a program that may get these secrets without a prompt, along
+               with everything it starts, for 1h or --for (30m, 2h, at most 12h).
+               Asks you to approve once
 
 examples:
   GITHUB_TOKEN=$(agent-keychain get github) gh pr list
-  agent-keychain run claude
+  agent-keychain with github,npm --for 2h -- claude
 
 exit codes: 0 ok, 1 error, 2 denied, 64 usage";
 
@@ -72,8 +74,8 @@ fn name(s: &str) -> Result<String, String> {
 
 fn run() -> Result<ExitCode, String> {
     let mut os_args = env::args_os().skip(1);
-    if os_args.next().is_some_and(|a| a == "run") {
-        return isolate(os_args.collect());
+    if os_args.next().is_some_and(|a| a == "with") {
+        return with(os_args.collect());
     }
     let args: Vec<String> = env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -97,15 +99,7 @@ fn run() -> Result<ExitCode, String> {
         }
     };
 
-    let path = socket_path();
-    let stream = UnixStream::connect(&path).map_err(|e| {
-        format!("cannot reach agent-keychaind at {}: {e} (is the service running?)", path.display())
-    })?;
-    let mut w = &stream;
-    proto::write_request(&mut w, &req).map_err(|e| format!("send: {e}"))?;
-    let resp = proto::read_response(&mut BufReader::new(&stream)).map_err(|e| format!("receive: {e}"))?;
-
-    match resp {
+    match request(&req)? {
         Response::Ok(data) => {
             print_ok(&req, &data).map_err(|e| e.to_string())?;
             Ok(ExitCode::SUCCESS)
@@ -118,22 +112,68 @@ fn run() -> Result<ExitCode, String> {
     }
 }
 
-/// Replaces this process with `cmd` in a new PID namespace. Its /proc shows only its
-/// own processes, so it cannot read the environment or file descriptors of the user's
-/// other processes. Files, network and the terminal stay as they are.
-fn isolate(mut cmd: Vec<OsString>) -> Result<ExitCode, String> {
-    if cmd.first().is_some_and(|a| a == "--") {
-        cmd.remove(0);
-    }
-    if cmd.is_empty() {
+fn request(req: &Request) -> Result<Response, String> {
+    let path = socket_path();
+    let stream = UnixStream::connect(&path).map_err(|e| {
+        format!("cannot reach agent-keychaind at {}: {e} (is the service running?)", path.display())
+    })?;
+    let mut w = &stream;
+    proto::write_request(&mut w, req).map_err(|e| format!("send: {e}"))?;
+    proto::read_response(&mut BufReader::new(&stream)).map_err(|e| format!("receive: {e}"))
+}
+
+/// `with <names> [--for 1h] [--] <program> [args...]`: asks once to let this process and
+/// everything it starts get these secrets without a prompt, then becomes the program.
+/// exec keeps the pid and start time the grant is tied to.
+fn with(args: Vec<OsString>) -> Result<ExitCode, String> {
+    let usage = || {
         eprintln!("{USAGE}");
-        return Ok(ExitCode::from(EXIT_USAGE));
+        Ok(ExitCode::from(EXIT_USAGE))
+    };
+    let mut args = args.into_iter();
+    let Some(list) = args.next() else { return usage() };
+    let list = list.into_string().map_err(|_| "secret names must be utf-8".to_string())?;
+    if !proto::valid_allow_list(&list) {
+        return Err(format!("bad names {list:?}: comma-separated, each 1 to 64 of a-z, 0-9, '.', '_', '-'"));
     }
-    let err = Command::new(BWRAP)
-        .args(["--dev-bind", "/", "/", "--unshare-pid", "--proc", "/proc", "--"])
-        .args(&cmd)
-        .exec();
-    Err(format!("cannot start {BWRAP}: {err} (is bubblewrap installed?)"))
+    let mut rest: Vec<OsString> = args.collect();
+    let mut secs = DEFAULT_ALLOW_SECS;
+    if rest.first().is_some_and(|a| a == "--for") {
+        let d = rest.get(1).and_then(|d| d.to_str()).ok_or("--for needs a duration like 30m or 2h")?;
+        secs = parse_duration(d)?;
+        rest.drain(..2);
+    }
+    if rest.first().is_some_and(|a| a == "--") {
+        rest.remove(0);
+    }
+    let Some((program, program_args)) = rest.split_first() else { return usage() };
+
+    match request(&Request::Allow(list, secs))? {
+        Response::Ok(_) => {}
+        Response::Denied => {
+            eprintln!("agent-keychain: denied");
+            return Ok(ExitCode::from(EXIT_DENIED));
+        }
+        Response::Err(msg) => return Err(msg),
+    }
+    let err = Command::new(program).args(program_args).exec();
+    Err(format!("cannot run {}: {err}", program.to_string_lossy()))
+}
+
+/// "90s", "30m", "2h" -> seconds, 1s to 12h.
+fn parse_duration(s: &str) -> Result<u64, String> {
+    let bad = || format!("bad duration {s:?}: use 30s, 30m or 2h, at most 12h");
+    let unit = match s.chars().last() {
+        Some('s') => 1,
+        Some('m') => 60,
+        Some('h') => 3600,
+        _ => return Err(bad()),
+    };
+    let n: u64 = s[..s.len() - 1].parse().map_err(|_| bad())?;
+    match n.checked_mul(unit) {
+        Some(secs) if (1..=proto::MAX_ALLOW_SECS).contains(&secs) => Ok(secs),
+        _ => Err(bad()),
+    }
 }
 
 fn print_ok(req: &Request, data: &[u8]) -> io::Result<()> {
@@ -153,6 +193,7 @@ fn print_ok(req: &Request, data: &[u8]) -> io::Result<()> {
         }
         Request::Set(n, _) => eprintln!("stored {n}"),
         Request::Rm(n) => eprintln!("removed {n}"),
+        Request::Allow(..) => {}
     }
     out.flush()
 }

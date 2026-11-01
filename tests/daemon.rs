@@ -218,25 +218,57 @@ fn one_prompt_at_a_time() {
 }
 
 #[test]
-fn run_hides_other_processes() {
-    if !Path::new("/usr/bin/bwrap").exists() {
-        eprintln!("skipped: no /usr/bin/bwrap");
-        return;
-    }
-    let mut env = Env::new("run");
+fn with_skips_prompts_for_its_programs() {
+    let mut env = Env::new("with");
     env.start(current_uid());
     assert_eq!(env.client(&["set", "github"], b"tok").0, 0);
+    assert_eq!(env.client(&["set", "stripe"], b"sk").0, 0);
+    let prompts = || read(&env.path("approvals")).lines().count();
 
-    let daemon = env.daemon.as_ref().unwrap().id();
-    let script = format!("echo $$; [ -e /proc/{daemon} ] && echo daemon visible; true");
-    let (code, out, err) = env.client(&["run", "--", "sh", "-c", &script], b"");
-    assert_eq!(code, 0, "{err}");
-    assert_eq!(out, "2\n", "pid 2 under bwrap, nothing else in sight");
+    // One prompt for the grant; the program and its children then get github freely.
+    let before = prompts();
+    let script = format!("{CLIENT} get github; echo; {CLIENT} get github");
+    let (code, out, err) = env.client(&["with", "github", "--for", "1m", "--", "sh", "-c", &script], b"");
+    assert_eq!((code, out.as_str()), (0, "tok\ntok"), "{err}");
+    assert_eq!(prompts(), before + 1);
+    assert!(read(&env.path("approvals")).contains("dev.agent-keychain.allow github"));
 
-    // Secrets still work from inside.
-    let (code, out, err) = env.client(&["run", CLIENT, "get", "github"], b"");
-    assert_eq!((code, out.as_str()), (0, "tok"), "{err}");
-    assert_eq!(env.client(&["run"], b"").0, 64);
+    // Secrets outside the grant still ask, and so does everyone outside the program.
+    let (code, out, _) = env.client(&["with", "github", CLIENT, "get", "stripe"], b"");
+    assert_eq!((code, out.as_str()), (0, "sk"));
+    assert_eq!(prompts(), before + 3, "grant prompt, then stripe prompt");
+    assert_eq!(env.client(&["get", "github"], b"").0, 0);
+    assert_eq!(prompts(), before + 4);
+
+    // Grants expire.
+    let script = format!("sleep 1.2; {CLIENT} get github");
+    assert_eq!(env.client(&["with", "github", "--for", "1s", "sh", "-c", &script], b"").1, "tok");
+    assert_eq!(prompts(), before + 6, "grant prompt, then a prompt after expiry");
+
+    // Denied: the program never runs.
+    fs::write(env.path("deny"), "").unwrap();
+    let (code, out, _) = env.client(&["with", "github", "--", "echo", "ran"], b"");
+    assert_eq!((code, out.as_str()), (2, ""));
+
+    let log = read(&env.path("state/log"));
+    for want in ["ALLOW github", "approved", "allowed-by-grant"] {
+        assert!(log.contains(want), "log lacks {want:?}:\n{log}");
+    }
+}
+
+#[test]
+fn with_bad_input() {
+    let mut env = Env::new("withbad");
+    env.start(current_uid());
+    assert_eq!(env.client(&["set", "github"], b"tok").0, 0);
+    assert_eq!(env.client(&["with"], b"").0, 64);
+    assert_eq!(env.client(&["with", "github"], b"").0, 64, "no program");
+    assert_eq!(env.client(&["with", "github", "--for", "1h"], b"").0, 64, "no program");
+    for bad in [&["with", "github", "--for", "13h", "true"][..], &["with", "github", "--for", "5", "true"],
+        &["with", "github,github", "true"], &["with", "Bad", "true"], &["with", "nope", "true"]] {
+        assert_eq!(env.client(bad, b"").0, 1, "{bad:?}");
+    }
+    assert!(!env.path("approvals").exists() || !read(&env.path("approvals")).contains("allow"), "never prompted");
 }
 
 #[test]

@@ -11,6 +11,7 @@ compile_error!("agent-keychain supports 64-bit Linux only");
 
 pub const SOL_SOCKET: c_int = 1;
 pub const SO_PEERCRED: c_int = 17;
+pub const SO_PEERPIDFD: c_int = 77;
 pub const PR_SET_DUMPABLE: c_int = 4;
 pub const ECHO: u32 = 0o10;
 pub const TCSANOW: c_int = 0;
@@ -55,6 +56,7 @@ unsafe extern "C" {
     pub fn tcsetattr(fd: c_int, action: c_int, t: *const termios) -> c_int;
     pub fn signal(sig: c_int, handler: sighandler_t) -> sighandler_t;
     pub fn raise(sig: c_int) -> c_int;
+    pub fn pidfd_send_signal(pidfd: c_int, sig: c_int, info: *mut c_void, flags: c_uint) -> c_int;
 }
 
 #[cfg(test)]

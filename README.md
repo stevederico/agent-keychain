@@ -31,7 +31,7 @@ agent-keychain get github        # print, needs approval
 agent-keychain list              # names only
 agent-keychain rm github         # delete, needs approval
 agent-keychain log               # recent requests
-agent-keychain run claude        # start an agent that cannot see your other processes
+agent-keychain with github,npm --for 2h -- claude   # ask once, then no prompts for these
 
 GITHUB_TOKEN=$(agent-keychain get github) gh pr list
 ```
@@ -44,7 +44,7 @@ As of November 2026. Checked against each project's docs and announcements (sour
 
 | Tool | Approval | Agent holds the secret | Where secrets live | Status |
 | --- | --- | --- | --- | --- |
-| **agent-keychain** | Every request, login password, prompt names the secret and caller | Yes | This machine only | New, Linux only |
+| **agent-keychain** | Every request, or once per program with `with`; login password; prompt names the secrets and caller | Yes | This machine only | New, Linux only |
 | 1Password CLI (`op`, desktop app integration) | Once per terminal session, then a session that refreshes on use | Yes | 1Password cloud, synced | Mature, paid |
 | Bitwarden CLI (`bw`) and Bitwarden MCP server | One unlock; the session key then opens the whole vault | Yes | Bitwarden cloud or self-hosted | Mature |
 | Bitwarden Agent Access SDK | Per request, human in the loop, end-to-end encrypted | Yes, just in time | Bitwarden vault | Early alpha, not for production |
@@ -58,13 +58,14 @@ As of November 2026. Checked against each project's docs and announcements (sour
 - A click is not enough: approval needs your login password, which an agent cannot type for you
 - Agents running as you cannot read the vault, unlike gnome-keyring
 - One prompt at a time, and backoff after a denial, so an agent cannot wear you down
-- `agent-keychain run` keeps agents from reading secrets handed to your other processes
+- `agent-keychain with` skips prompts only for the program you started, for the secrets and time you approved. Other agents still get asked
 - Nothing leaves the machine; no account
 
 **Where it is weaker**
 
 - The agent receives the plaintext secret. Proxy brokers like Infisical Agent Vault never hand it over, so a prompt-injected agent cannot leak it. They only cover HTTPS APIs, though
 - No sync, sharing, phone or browser autofill
+- Secrets handed to one agent can be read by other agents running as you, through `/proc`. Run agents in their own sandbox (Claude Code and Codex have one) to close that
 - Linux and polkit only
 - The crypto is a faithful port of libsodium, but the port itself has not been audited
 - Young code with no outside users yet

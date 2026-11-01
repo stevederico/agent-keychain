@@ -1,6 +1,7 @@
 //! Wire protocol over the Unix socket. One request and one response per connection.
 //!
 //! Request:  `LIST\n` | `LOG\n` | `GET <name>\n` | `RM <name>\n` | `SET <name>\n<len>\n<bytes>`
+//!           | `ALLOW <name>[,<name>...] <seconds>\n`
 //! Response: `OK <len>\n<bytes>` | `DENIED\n` | `ERR <message>\n`
 
 use crate::crypto::SecretBytes;
@@ -10,6 +11,10 @@ use std::io::{self, BufRead, Read, Write};
 pub const MAX_SECRET: usize = 16 * 1024;
 const MAX_RESPONSE: usize = 1024 * 1024;
 const MAX_LINE: u64 = 256;
+/// Longest comma-separated name list in an ALLOW request.
+pub const MAX_ALLOW_LIST: usize = 200;
+/// Longest time an ALLOW grant lasts: 12 hours.
+pub const MAX_ALLOW_SECS: u64 = 12 * 3600;
 
 pub enum Request {
     List,
@@ -17,6 +22,9 @@ pub enum Request {
     Get(String),
     Rm(String),
     Set(String, SecretBytes),
+    /// Let the asking process and its descendants `get` these secrets (comma-separated)
+    /// without a prompt for this many seconds.
+    Allow(String, u64),
 }
 
 impl Request {
@@ -27,12 +35,13 @@ impl Request {
             Request::Get(_) => "GET",
             Request::Rm(_) => "RM",
             Request::Set(..) => "SET",
+            Request::Allow(..) => "ALLOW",
         }
     }
 
     pub fn name(&self) -> Option<&str> {
         match self {
-            Request::Get(n) | Request::Rm(n) | Request::Set(n, _) => Some(n),
+            Request::Get(n) | Request::Rm(n) | Request::Set(n, _) | Request::Allow(n, _) => Some(n),
             Request::List | Request::Log => None,
         }
     }
@@ -73,6 +82,14 @@ fn named(name: Option<&str>) -> io::Result<String> {
     Ok(n.to_string())
 }
 
+/// Checks an ALLOW name list: 1 or more valid names, comma-separated, no repeats.
+pub fn valid_allow_list(list: &str) -> bool {
+    let names: Vec<&str> = list.split(',').collect();
+    list.len() <= MAX_ALLOW_LIST
+        && names.iter().all(|n| valid_name(n))
+        && names.iter().enumerate().all(|(i, n)| !names[..i].contains(n))
+}
+
 pub fn read_request(r: &mut impl BufRead) -> io::Result<Request> {
     let line = read_line(r)?;
     let (verb, name) = match line.split_once(' ') {
@@ -84,6 +101,17 @@ pub fn read_request(r: &mut impl BufRead) -> io::Result<Request> {
         ("LOG", None) => Ok(Request::Log),
         ("GET", n) => Ok(Request::Get(named(n)?)),
         ("RM", n) => Ok(Request::Rm(named(n)?)),
+        ("ALLOW", Some(rest)) => {
+            let (list, secs) = rest.rsplit_once(' ').ok_or_else(|| invalid("missing duration"))?;
+            if !valid_allow_list(list) {
+                return Err(invalid("bad secret name list"));
+            }
+            let secs: u64 = secs.parse().map_err(|_| invalid("bad duration"))?;
+            if secs == 0 || secs > MAX_ALLOW_SECS {
+                return Err(invalid("duration out of range"));
+            }
+            Ok(Request::Allow(list.to_string(), secs))
+        }
         ("SET", n) => {
             let name = named(n)?;
             let len = read_len(r, 1, MAX_SECRET)?;
@@ -101,6 +129,7 @@ pub fn write_request(w: &mut impl Write, req: &Request) -> io::Result<()> {
         Request::Log => w.write_all(b"LOG\n")?,
         Request::Get(n) => writeln!(w, "GET {n}")?,
         Request::Rm(n) => writeln!(w, "RM {n}")?,
+        Request::Allow(list, secs) => writeln!(w, "ALLOW {list} {secs}")?,
         Request::Set(n, v) => {
             write!(w, "SET {n}\n{}\n", v.len())?;
             w.write_all(v)?;
@@ -162,12 +191,18 @@ mod tests {
             Request::Set(n, v) => assert_eq!((n.as_str(), &v[..]), ("github", &b"a\nb"[..])),
             _ => panic!(),
         }
+        assert!(matches!(roundtrip(Request::Allow("github,aws.prod".into(), 3600)),
+            Request::Allow(l, 3600) if l == "github,aws.prod"));
     }
 
     #[test]
     fn rejects_bad_requests() {
         for raw in [&b"GET ../etc\n"[..], b"GET\n", b"LIST x\n", b"NOPE\n", b"SET github\n0\n", b"GET github"] {
             assert!(read_request(&mut &raw[..]).is_err(), "{raw:?}");
+        }
+        for raw in ["ALLOW github\n", "ALLOW github 0\n", "ALLOW github 43201\n", "ALLOW github,github 60\n",
+            "ALLOW github, 60\n", "ALLOW ,github 60\n", "ALLOW Git 60\n", "ALLOW github -5\n"] {
+            assert!(read_request(&mut raw.as_bytes()).is_err(), "{raw:?}");
         }
         let long = format!("GET {}\n", "a".repeat(400));
         assert!(read_request(&mut long.as_bytes()).is_err());
