@@ -1,6 +1,11 @@
 - Add proxy mode (agent never sees secret; plug into cloak/OneCLI or own TLS)
 - Add agent-browser login plugin (credential.read, agent never sees password)
-- Add Mac support (Authorization Services, launchd, Keychain, libproc)
+- Add Mac support (Authorization Services, launchd, Keychain, libproc, LOCAL_PEERCRED/audit token, getentropy, PT_DENY_ATTACH, macOS struct layouts in sys.rs)
+
+0.18.0
+
+  Sync crate version
+  Expand Mac to-do
 
 0.17.0
 
