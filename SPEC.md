@@ -18,7 +18,7 @@ The main threat is a program running as the user that reads secrets without aski
 | --- | --- | --- |
 | A program running as the user reads the store | Yes | Files and memory belong to a separate system user |
 | An agent fakes the approval click (wtype, ydotool) | Yes | Approval needs the login password, which the agent doesn't have |
-| An agent pretends to be another agent | Partly | Caller identity comes from the kernel (PID, exe path), but a script can run under any interpreter |
+| An agent pretends to be another agent | Partly | The caller's uid and pid come from the kernel (`SO_PEERCRED`), but its name comes from `/proc/<pid>/comm`, which any process can set |
 | An agent leaks a secret after it gets it | No | Out of scope: approval controls who gets a key, not what they do with it |
 | Root, or a hacked kernel | No | Root can read anything |
 | Stolen disk | Yes | Encrypted at rest |
@@ -26,7 +26,7 @@ The main threat is a program running as the user that reads secrets without aski
 ## How it works
 
 1. `agent-keychaind` runs as system user `agent-keychain` (systemd service, hardened: `ProtectHome`, `NoNewPrivileges`, `MemoryDenyWriteExecute`, no network)
-2. It listens on `/run/agent-keychain/sock`, writable only by the user's group
+2. It listens on `/run/agent-keychain/sock`, mode 0666: any local user can connect, but only the owner uid is served
 3. A client sends `get github`
 4. The daemon reads the caller with `SO_PEERCRED` (uid, pid) and refuses any uid but the owner's
    - It names the caller from `/proc/<pid>/comm` up the parent chain (`agent-keychain <- zsh <- claude`). Processes pick their own names, so this is a hint, not proof
@@ -74,6 +74,8 @@ Agent use: `GITHUB_TOKEN=$(agent-keychain get github) gh pr list`
 - **Once**: every `get`, `set` and `rm` prompts (polkit `auth_self`). `list` and `log` never show values and don't prompt
 - **Deny**: the client exits 2 and prints nothing
 - Log line: time, request, secret name, uid, pid, caller chain, outcome. Never values
+- Logged: every request, including `list`, `log`, other users' refused connections and malformed requests
+- Outcomes: `allowed`, `stored`, `removed`, `listed`, `shown`, `denied`, `missing`, `error` (approval could not run), `refused`, `malformed`
 - Not built yet: "approve for 1 hour"
 
 ## Open questions

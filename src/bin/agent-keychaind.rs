@@ -8,12 +8,12 @@ use agent_keychain::vault::Vault;
 use agent_keychain::{sys, time};
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, Write};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::os::raw::c_ulong;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
@@ -40,7 +40,8 @@ struct Config {
     state_dir: PathBuf,
     key_file: Option<PathBuf>,
     owner_uid: u32,
-    /// Test hook: a program run as `PROGRAM <action> <name> <caller>`; exit 0 approves.
+    /// Test hook: a program run as `PROGRAM <action> <name> <caller>`. Exit codes as
+    /// pkcheck: 0 approves, 1 or 3 denies, anything else is an error.
     /// Without it, approval goes through polkit.
     approver: Option<PathBuf>,
 }
@@ -163,125 +164,105 @@ fn serve(sh: &Shared, stream: &UnixStream) -> io::Result<()> {
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
     let mut w = stream;
     let peer = peer::peer_cred(stream.as_raw_fd())?;
+    let caller = peer::describe_caller(peer.pid);
     if peer.uid != sh.cfg.owner_uid {
+        record(sh, "CONNECT", "-", &peer, &caller, "refused");
         return proto::write_err(&mut w, "this keychain belongs to another user");
     }
 
     let req = match proto::read_request(&mut BufReader::new(stream)) {
         Ok(r) => r,
-        Err(e) => return proto::write_err(&mut w, &e.to_string()),
+        Err(e) => {
+            record(sh, "BAD", "-", &peer, &caller, "malformed");
+            return proto::write_err(&mut w, &e.to_string());
+        }
     };
-    let caller = peer::describe_caller(peer.pid);
+    // Log even when the reply could not be sent: the outcome happened either way.
+    let (outcome, sent) = respond(sh, &req, &peer, &caller, &mut w);
+    record(sh, req.verb(), req.name().unwrap_or("-"), &peer, &caller, outcome);
+    sent
+}
 
-    let outcome = match &req {
+/// The outcome to log, and whether the reply reached the client.
+type Reply = (&'static str, io::Result<()>);
+
+fn respond(sh: &Shared, req: &Request, peer: &Peer, caller: &str, w: &mut impl Write) -> Reply {
+    match req {
         Request::List => {
             let names = lock(&sh.vault).names().collect::<Vec<_>>().join("\n");
-            return proto::write_ok(&mut w, names.as_bytes());
+            ("listed", proto::write_ok(w, names.as_bytes()))
         }
-        Request::Log => {
-            let log = fs::read_to_string(sh.cfg.state_dir.join("log")).unwrap_or_default();
-            let lines: Vec<&str> = log.lines().collect();
-            let tail = lines[lines.len().saturating_sub(LOG_TAIL)..].join("\n");
-            return proto::write_ok(&mut w, tail.as_bytes());
-        }
+        Request::Log => ("shown", proto::write_ok(w, &log_tail(&sh.cfg.state_dir.join("log")))),
         Request::Get(name) => {
             if !lock(&sh.vault).contains(name) {
-                proto::write_err(&mut w, &format!("no secret named {name}"))?;
-                "missing"
-            } else if !approved(sh, ACTION_READ, name, &caller, &peer, &mut w)? {
-                "denied"
-            } else {
-                // Read after approval: the value may have changed while the prompt was up.
-                let value = lock(&sh.vault).get(name);
-                match value {
-                    Ok(Some(v)) => {
-                        proto::write_ok(&mut w, &v)?;
-                        "allowed"
-                    }
-                    Ok(None) => {
-                        proto::write_err(&mut w, &format!("no secret named {name}"))?;
-                        "missing"
-                    }
-                    Err(e) => {
-                        proto::write_err(&mut w, &format!("cannot open {name}: {e}"))?;
-                        "error"
-                    }
-                }
+                return missing(w, name);
+            }
+            if let Some(refused) = gate(sh, ACTION_READ, name, caller, peer, w) {
+                return refused;
+            }
+            // Read after approval: the value may have changed while the prompt was up.
+            let value = lock(&sh.vault).get(name);
+            match value {
+                Ok(Some(v)) => ("allowed", proto::write_ok(w, &v)),
+                Ok(None) => missing(w, name),
+                Err(e) => ("error", proto::write_err(w, &format!("cannot open {name}: {e}"))),
             }
         }
         Request::Set(name, value) => {
-            if !approved(sh, ACTION_WRITE, name, &caller, &peer, &mut w)? {
-                "denied"
-            } else {
-                let saved = lock(&sh.vault).set(name, value);
-                match saved {
-                    Ok(()) => {
-                        proto::write_ok(&mut w, b"")?;
-                        "stored"
-                    }
-                    Err(e) => {
-                        proto::write_err(&mut w, &format!("cannot save: {e}"))?;
-                        "error"
-                    }
-                }
+            if let Some(refused) = gate(sh, ACTION_WRITE, name, caller, peer, w) {
+                return refused;
+            }
+            let saved = lock(&sh.vault).set(name, value);
+            match saved {
+                Ok(()) => ("stored", proto::write_ok(w, b"")),
+                Err(e) => ("error", proto::write_err(w, &format!("cannot save: {e}"))),
             }
         }
         Request::Rm(name) => {
             if !lock(&sh.vault).contains(name) {
-                proto::write_err(&mut w, &format!("no secret named {name}"))?;
-                "missing"
-            } else if !approved(sh, ACTION_WRITE, name, &caller, &peer, &mut w)? {
-                "denied"
-            } else {
-                let removed = lock(&sh.vault).remove(name);
-                match removed {
-                    Ok(_) => {
-                        proto::write_ok(&mut w, b"")?;
-                        "removed"
-                    }
-                    Err(e) => {
-                        proto::write_err(&mut w, &format!("cannot save: {e}"))?;
-                        "error"
-                    }
-                }
+                return missing(w, name);
             }
-        }
-    };
-    record(sh, &req, &peer, &caller, outcome);
-    Ok(())
-}
-
-/// Asks for approval. On a denial or an approver failure, writes the response itself.
-fn approved(
-    sh: &Shared,
-    action: &str,
-    name: &str,
-    caller: &str,
-    peer: &Peer,
-    w: &mut impl Write,
-) -> io::Result<bool> {
-    match ask(sh, action, name, caller, peer) {
-        Ok(true) => Ok(true),
-        Ok(false) => {
-            proto::write_denied(w)?;
-            Ok(false)
-        }
-        Err(e) => {
-            proto::write_err(w, &format!("approval failed: {e}"))?;
-            Ok(false)
+            if let Some(refused) = gate(sh, ACTION_WRITE, name, caller, peer, w) {
+                return refused;
+            }
+            let removed = lock(&sh.vault).remove(name);
+            match removed {
+                Ok(true) => ("removed", proto::write_ok(w, b"")),
+                // Removed by another request while the prompt was up.
+                Ok(false) => missing(w, name),
+                Err(e) => ("error", proto::write_err(w, &format!("cannot save: {e}"))),
+            }
         }
     }
 }
 
-fn ask(sh: &Shared, action: &str, name: &str, caller: &str, peer: &Peer) -> io::Result<bool> {
-    let status = match &sh.cfg.approver {
-        Some(program) => {
-            Command::new(program).args([action, name, caller]).stdin(Stdio::null()).status()?
+fn missing(w: &mut impl Write, name: &str) -> Reply {
+    ("missing", proto::write_err(w, &format!("no secret named {name}")))
+}
+
+/// Asks for approval. None when approved; otherwise the denial or failure already sent.
+fn gate(sh: &Shared, action: &str, name: &str, caller: &str, peer: &Peer, w: &mut impl Write) -> Option<Reply> {
+    match ask(sh, action, name, caller, peer) {
+        Ok(true) => None,
+        Ok(false) => Some(("denied", proto::write_denied(w))),
+        Err(e) => {
+            eprintln!("agent-keychaind: approval: {e}");
+            Some(("error", proto::write_err(w, &format!("approval failed: {e}"))))
         }
+    }
+}
+
+/// Ok(true) approved, Ok(false) denied, Err when no decision could be made.
+fn ask(sh: &Shared, action: &str, name: &str, caller: &str, peer: &Peer) -> io::Result<bool> {
+    let (program, status) = match &sh.cfg.approver {
+        Some(program) => (
+            program.display().to_string(),
+            Command::new(program).args([action, name, caller]).stdin(Stdio::null()).status()?,
+        ),
         None => {
             // pid + start time + uid pins the subject, so a reused pid cannot inherit the answer.
             let (_, start) = peer::proc_stat(peer.pid)?;
-            Command::new(PKCHECK)
+            let status = Command::new(PKCHECK)
                 .args(["--action-id", action])
                 .args(["--process", &format!("{},{},{}", peer.pid, start, peer.uid)])
                 .arg("--allow-user-interaction")
@@ -289,18 +270,44 @@ fn ask(sh: &Shared, action: &str, name: &str, caller: &str, peer: &Peer) -> io::
                 .args(["--detail", "caller", caller])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .status()?
+                .status()?;
+            (PKCHECK.to_string(), status)
         }
     };
-    Ok(status.code() == Some(0))
+    // pkcheck(1): 0 authorized, 1 not authorized, 2 no authentication agent,
+    // 3 dialog dismissed, 127 error. The approver hook follows the same codes.
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1 | 3) => Ok(false),
+        Some(2) => Err(io::Error::other("no polkit authentication agent is running")),
+        _ => Err(io::Error::other(format!("{program}: {status}"))),
+    }
 }
 
-fn record(sh: &Shared, req: &Request, peer: &Peer, caller: &str, outcome: &str) {
+/// The last LOG_TAIL lines, reading only the end of the file.
+fn log_tail(path: &Path) -> Vec<u8> {
+    const WINDOW: u64 = 64 * 1024;
+    let Ok(mut f) = File::open(path) else { return Vec::new() };
+    let start = f.metadata().map_or(0, |m| m.len()).saturating_sub(WINDOW);
+    let mut buf = Vec::new();
+    if f.seek(SeekFrom::Start(start)).is_err() || f.take(WINDOW).read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+    let mut text = buf.as_slice();
+    if start > 0 {
+        // Drop the partial first line.
+        text = text.iter().position(|&b| b == b'\n').map_or(&[][..], |i| &text[i + 1..]);
+    }
+    let lines: Vec<&[u8]> = text.split(|&b| b == b'\n').filter(|l| !l.is_empty()).collect();
+    lines[lines.len().saturating_sub(LOG_TAIL)..].join(&b'\n')
+}
+
+fn record(sh: &Shared, verb: &str, name: &str, peer: &Peer, caller: &str, outcome: &str) {
     let line = format!(
         "{} {} {} uid={} pid={} caller=\"{}\" {}\n",
         time::utc_now(),
-        req.verb(),
-        req.name().unwrap_or("-"),
+        verb,
+        name,
         peer.uid,
         peer.pid,
         caller,

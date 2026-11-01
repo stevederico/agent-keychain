@@ -10,6 +10,8 @@ use std::os::raw::c_int;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const SOCKET: &str = "/run/agent-keychain/sock";
 const EXIT_DENIED: u8 = 2;
@@ -161,7 +163,27 @@ fn read_secret(name: &str) -> Result<SecretBytes, String> {
     result
 }
 
-/// Turns terminal echo off until dropped.
+/// The terminal to restore if a signal kills us while echo is off.
+static SAVED: OnceLock<(c_int, sys::termios)> = OnceLock::new();
+static ECHO_IS_OFF: AtomicBool = AtomicBool::new(false);
+const FATAL_SIGNALS: [c_int; 4] = [sys::SIGHUP, sys::SIGINT, sys::SIGQUIT, sys::SIGTERM];
+
+/// Puts echo back, then dies of the same signal. Only async-signal-safe calls.
+extern "C" fn on_fatal_signal(sig: c_int) {
+    if ECHO_IS_OFF.swap(false, Ordering::SeqCst)
+        && let Some((fd, t)) = SAVED.get()
+    {
+        // SAFETY: restores a termios saved from this terminal; tcsetattr is signal-safe.
+        unsafe { sys::tcsetattr(*fd, sys::TCSANOW, t) };
+    }
+    // SAFETY: signal and raise are async-signal-safe and take no pointers.
+    unsafe {
+        sys::signal(sig, sys::SIG_DFL);
+        sys::raise(sig);
+    }
+}
+
+/// Turns terminal echo off until dropped, or until Ctrl-C and friends kill the process.
 struct EchoOff {
     fd: c_int,
     saved: sys::termios,
@@ -176,12 +198,20 @@ impl EchoOff {
             return Err(io::Error::last_os_error());
         }
         let saved = t;
+        // One prompt per process, so the first saved state is the one to restore.
+        let _ = SAVED.set((fd, saved));
+        ECHO_IS_OFF.store(true, Ordering::SeqCst);
+        for sig in FATAL_SIGNALS {
+            // SAFETY: the handler is an extern "C" fn(c_int) that only makes signal-safe calls.
+            unsafe { sys::signal(sig, on_fatal_signal as *const () as sys::sighandler_t) };
+        }
+        let guard = EchoOff { fd, saved };
         t.c_lflag &= !sys::ECHO;
         // SAFETY: `t` is a valid termios read from this terminal.
         if unsafe { sys::tcsetattr(fd, sys::TCSANOW, &t) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(EchoOff { fd, saved })
+        Ok(guard)
     }
 }
 
@@ -189,5 +219,10 @@ impl Drop for EchoOff {
     fn drop(&mut self) {
         // SAFETY: restores the termios saved from this terminal.
         unsafe { sys::tcsetattr(self.fd, sys::TCSANOW, &self.saved) };
+        ECHO_IS_OFF.store(false, Ordering::SeqCst);
+        for sig in FATAL_SIGNALS {
+            // SAFETY: SIG_DFL takes no pointers.
+            unsafe { sys::signal(sig, sys::SIG_DFL) };
+        }
     }
 }

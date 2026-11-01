@@ -14,6 +14,14 @@ pub const SO_PEERCRED: c_int = 17;
 pub const PR_SET_DUMPABLE: c_int = 4;
 pub const ECHO: u32 = 0o10;
 pub const TCSANOW: c_int = 0;
+pub const SIGHUP: c_int = 1;
+pub const SIGINT: c_int = 2;
+pub const SIGQUIT: c_int = 3;
+pub const SIGTERM: c_int = 15;
+pub const SIG_DFL: sighandler_t = 0;
+
+/// A handler address, or SIG_DFL.
+pub type sighandler_t = usize;
 
 #[repr(C)]
 #[derive(Default)]
@@ -45,6 +53,8 @@ unsafe extern "C" {
     pub fn isatty(fd: c_int) -> c_int;
     pub fn tcgetattr(fd: c_int, t: *mut termios) -> c_int;
     pub fn tcsetattr(fd: c_int, action: c_int, t: *const termios) -> c_int;
+    pub fn signal(sig: c_int, handler: sighandler_t) -> sighandler_t;
+    pub fn raise(sig: c_int) -> c_int;
 }
 
 #[cfg(test)]

@@ -2,14 +2,20 @@
 # Builds and installs agent-keychain system-wide for the user who runs it.
 # Usage: ./install.sh   (builds as you, then asks for sudo)
 set -euo pipefail
-cd "$(dirname "$0")"
+script=$(realpath "$0")
+cd "$(dirname "$script")"
 
 if [[ $EUID -ne 0 ]]; then
   cargo build --release --locked
-  exec sudo "$0"
+  exec sudo "$script" --after-build
 fi
 
-owner_uid=${SUDO_UID:?run ./install.sh as your user, not as root}
+# Root without the marker skipped the build and would install stale binaries.
+if [[ ${1:-} != --after-build || -z ${SUDO_UID:-} ]]; then
+  echo "run ./install.sh as your user, not as root: it builds first, then asks for sudo" >&2
+  exit 1
+fi
+owner_uid=$SUDO_UID
 
 install -Dm755 target/release/agent-keychaind /usr/bin/agent-keychaind
 install -Dm755 target/release/agent-keychain /usr/bin/agent-keychain

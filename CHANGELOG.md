@@ -1,6 +1,19 @@
 - Test real polkit install
 - Consider 1-hour approval
 
+0.5.0
+
+  Log every request
+  Log failed replies
+  Separate approval errors
+  Fix rm race
+  Tail log cheaply
+  Restore echo on Ctrl-C
+  Fix install re-exec
+  Block stale installs
+  Gate release tests
+  Correct spec
+
 0.4.0
 
   Add daemon

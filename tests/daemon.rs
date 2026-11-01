@@ -1,4 +1,8 @@
 //! End to end: a real daemon and client, with a scripted approver in place of polkit.
+//!
+//! Debug builds only. A release client ignores AGENT_KEYCHAIN_SOCKET and would talk to
+//! the real system daemon, so `cargo test --release` must not run these.
+#![cfg(debug_assertions)]
 
 use agent_keychain::peer::current_uid;
 use std::fs;
@@ -149,7 +153,10 @@ fn full_flow() {
     // Log records outcomes but never values.
     let (code, log, _) = env.client(&["log"], b"");
     assert_eq!(code, 0);
-    for want in ["SET github", "GET github", "allowed", "denied", "GET nope", "missing", "RM stripe", "removed"] {
+    for want in ["SET github", "GET github", "allowed", "denied", "GET nope", "missing", "RM stripe", "removed"]
+        .into_iter()
+        .chain(["LIST - ", "listed"])
+    {
         assert!(log.contains(want), "log lacks {want:?}:\n{log}");
     }
     assert!(!log.contains("ghp_test123") && !log.contains("sk_test_456"));
@@ -177,6 +184,8 @@ fn other_users_are_refused() {
     assert_eq!(code, 1);
     assert!(err.contains("belongs to another user"), "{err}");
     assert!(!env.path("approvals").exists(), "approver must not run");
+    let log = read(&env.path("state/log"));
+    assert!(log.contains("CONNECT - ") && log.contains("refused"), "{log}");
 }
 
 #[test]
