@@ -23,6 +23,14 @@ A local secret store that gives an AI agent a secret only after you approve that
 
 Builds as you, then asks for sudo to install the daemon, polkit policy and systemd service.
 
+## Update
+
+```
+cd ~/Projects/agent-keychain && git pull && ./install.sh
+```
+
+Safe to rerun. The vault and its key are never touched.
+
 ## Use
 
 ```

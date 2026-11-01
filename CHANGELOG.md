@@ -2,6 +2,10 @@
 - Consider 1-hour approval
 - Add proxy mode (agent never sees secret; plug into cloak/OneCLI or own TLS)
 
+0.13.0
+
+  Document updating
+
 0.12.0
 
   Signal systemd readiness
