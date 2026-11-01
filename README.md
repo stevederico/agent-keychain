@@ -4,7 +4,7 @@ A local secret store that gives an AI agent a secret only after you approve that
 
 - Linux only (built for Omarchy)
 - No account, no cloud, no sync
-- Rust, std only, zero crates
+- Zero-crate Rust: no dependencies, std only (`[dependencies]` is empty)
 
 ## How it works
 
