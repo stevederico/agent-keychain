@@ -2,6 +2,12 @@
 - Add agent-browser login plugin (credential.read, agent never sees password)
 - Add Mac support (Authorization Services, launchd, Keychain, libproc, LOCAL_PEERCRED/audit token, getentropy, PT_DENY_ATTACH, macOS struct layouts in sys.rs)
 
+0.20.0
+
+  Add batch import
+  Add import --all
+  Refuse import overwrites
+
 0.19.0
 
   Add scan command

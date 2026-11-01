@@ -35,9 +35,9 @@ commands:
   skill        print the guide for AI agents (start here if you are one)
   scan [dir]   find secrets in plain files (.env, shell config, ~/.npmrc, ...).
                Read only; shows where, never the values. --json for scripts
-  import <file>:<line> [name]
-               store a secret that scan found (asks you to approve).
-               The file is left as it is
+  import <file>:<line>[=name]...
+               store secrets that scan found, under one approval.
+               --all imports everything scan finds. Files are left as they are
   with <names> <program>
                run a program that may get these secrets without a prompt, along
                with everything it starts, for 1h or --for (30m, 2h, at most 12h).
@@ -100,8 +100,8 @@ fn run() -> Result<ExitCode, String> {
             Request::Set(n, value)
         }
         ["scan", rest @ ..] => return scan_cmd(rest),
-        ["import", spec] => import(spec, None)?,
-        ["import", spec, n] => import(spec, Some(n))?,
+        ["import", "--all"] => import_all()?,
+        ["import", specs @ ..] if !specs.is_empty() => import(specs)?,
         ["skill"] => {
             print!("{SKILL}");
             return Ok(ExitCode::SUCCESS);
@@ -217,7 +217,7 @@ fn print_ok(req: &Request, data: &[u8], json: bool) -> io::Result<()> {
                 out.write_all(b"\n")?;
             }
         }
-        Request::Set(n, _) => {
+        Request::Set(n, _) | Request::SetMany(n, _) => {
             eprintln!("stored {n}");
             if matches!(env::args().nth(1).as_deref(), Some("import")) {
                 eprintln!("The plain copy is still in that file. Remove it once nothing reads it from there.");
@@ -299,16 +299,78 @@ fn scan_cmd(args: &[&str]) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// The SET request for a secret scan found at `file:line`.
-fn import(spec: &str, name_arg: Option<&str>) -> Result<Request, String> {
-    let (file, line) = spec.rsplit_once(':').ok_or("use <file>:<line>, as scan prints it")?;
-    let line: usize = line.parse().map_err(|_| format!("bad line number in {spec:?}"))?;
-    let path = untilde(file)?;
-    let found = scan::finding_at(&path, line).map_err(|e| e.to_string())?;
-    let n = name(name_arg.map_or(found.suggested_name(), str::to_string).as_str())?;
-    eprintln!("importing {} from {spec} as {n}", found.preview());
-    let value = SecretBytes::from_slice(found.value.as_bytes());
-    Ok(Request::Set(n, value))
+/// `file:line` or `file:line=name`, as given to import.
+fn parse_spec(spec: &str) -> Result<(PathBuf, usize, Option<String>), String> {
+    let (place, name_arg) = match spec.rsplit_once('=') {
+        Some((p, n)) if p.rsplit_once(':').is_some_and(|(_, l)| l.parse::<usize>().is_ok()) => (p, Some(name(n)?)),
+        _ => (spec, None),
+    };
+    let (file, line) = place.rsplit_once(':').ok_or("use <file>:<line>, as scan prints it")?;
+    let line = line.parse().map_err(|_| format!("bad line number in {spec:?}"))?;
+    Ok((untilde(file)?, line, name_arg))
+}
+
+/// The store request for the secrets scan found at these `file:line[=name]` specs.
+fn import(specs: &[&str]) -> Result<Request, String> {
+    let mut items = Vec::new();
+    for spec in specs {
+        let (path, line, name_arg) = parse_spec(spec)?;
+        let found = scan::finding_at(&path, line).map_err(|e| e.to_string())?;
+        items.push((name_arg.unwrap_or_else(|| found.suggested_name()), found));
+    }
+    store_request(items, false)
+}
+
+/// Everything a home scan finds, each value once, under unique names.
+fn import_all() -> Result<Request, String> {
+    let mut items: Vec<(String, scan::Finding)> = Vec::new();
+    for f in scan::scan_files(&scan::home_files(&home()?)) {
+        if !items.iter().any(|(_, g)| g.value == f.value) {
+            items.push((f.suggested_name(), f));
+        }
+    }
+    store_request(items, true)
+}
+
+/// One SET, or a SETMANY so a batch needs a single approval. Never overwrites: names
+/// already in the vault are refused, or with `rename` get a -2, -3 suffix.
+fn store_request(mut items: Vec<(String, scan::Finding)>, rename: bool) -> Result<Request, String> {
+    if items.is_empty() {
+        return Err("nothing to import".into());
+    }
+    if items.len() > proto::MAX_BATCH {
+        return Err(format!("at most {} at a time", proto::MAX_BATCH));
+    }
+    let stored: Vec<String> = match request(&Request::List)? {
+        Response::Ok(data) => String::from_utf8_lossy(&data).lines().map(str::to_string).collect(),
+        Response::Err(msg) => return Err(msg),
+        Response::Denied => return Err("denied".into()),
+    };
+    let mut taken = stored.clone();
+    for (n, _) in &mut items {
+        if rename && taken.contains(n) {
+            let base = n.clone();
+            *n = (2..).map(|i| format!("{base}-{i}")).find(|c| !taken.contains(c) && valid_name(c)).unwrap_or(base);
+        }
+        if stored.contains(n) {
+            return Err(format!("{n} is already stored. Name it with <file>:<line>=<name>, or rm it first"));
+        }
+        if taken.contains(n) {
+            return Err(format!("two secrets would both be named {n}. Name them with <file>:<line>=<name>"));
+        }
+        taken.push(n.clone());
+    }
+    for (n, f) in &items {
+        eprintln!("importing {} from {}:{} as {n}", f.preview(), tilde(&f.path), f.line);
+    }
+    let mut items: Vec<(String, SecretBytes)> =
+        items.into_iter().map(|(n, f)| (n, SecretBytes::from_slice(f.value.as_bytes()))).collect();
+    if items.len() == 1 {
+        let (n, v) = items.remove(0);
+        return Ok(Request::Set(n, v));
+    }
+    let list = items.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(",");
+    Ok(Request::SetMany(list, items))
 }
 
 fn json_string(s: &str) -> String {

@@ -2,6 +2,7 @@
 //!
 //! Request:  `LIST\n` | `LOG\n` | `GET <name>\n` | `RM <name>\n` | `SET <name>\n<len>\n<bytes>`
 //!           | `ALLOW <name>[,<name>...] <seconds>\n`
+//!           | `SETMANY <count>\n` then `<count>` times `<name>\n<len>\n<bytes>`
 //! Response: `OK <len>\n<bytes>` | `DENIED\n` | `ERR <message>\n`
 
 use crate::crypto::SecretBytes;
@@ -13,6 +14,8 @@ const MAX_RESPONSE: usize = 1024 * 1024;
 const MAX_LINE: u64 = 256;
 /// Longest comma-separated name list in an ALLOW request.
 pub const MAX_ALLOW_LIST: usize = 200;
+/// Most secrets in one SETMANY.
+pub const MAX_BATCH: usize = 32;
 /// Longest time an ALLOW grant lasts: 12 hours.
 pub const MAX_ALLOW_SECS: u64 = 12 * 3600;
 
@@ -25,6 +28,8 @@ pub enum Request {
     /// Let the asking process and its descendants `get` these secrets (comma-separated)
     /// without a prompt for this many seconds.
     Allow(String, u64),
+    /// Store several secrets under one approval. The String is the names, comma-separated.
+    SetMany(String, Vec<(String, SecretBytes)>),
 }
 
 impl Request {
@@ -34,14 +39,18 @@ impl Request {
             Request::Log => "LOG",
             Request::Get(_) => "GET",
             Request::Rm(_) => "RM",
-            Request::Set(..) => "SET",
+            Request::Set(..) | Request::SetMany(..) => "SET",
             Request::Allow(..) => "ALLOW",
         }
     }
 
     pub fn name(&self) -> Option<&str> {
         match self {
-            Request::Get(n) | Request::Rm(n) | Request::Set(n, _) | Request::Allow(n, _) => Some(n),
+            Request::Get(n)
+            | Request::Rm(n)
+            | Request::Set(n, _)
+            | Request::Allow(n, _)
+            | Request::SetMany(n, _) => Some(n),
             Request::List | Request::Log => None,
         }
     }
@@ -112,6 +121,25 @@ pub fn read_request(r: &mut impl BufRead) -> io::Result<Request> {
             }
             Ok(Request::Allow(list.to_string(), secs))
         }
+        ("SETMANY", Some(count)) => {
+            let count: usize = count.parse().map_err(|_| invalid("bad count"))?;
+            if count == 0 || count > MAX_BATCH {
+                return Err(invalid("count out of range"));
+            }
+            let mut items: Vec<(String, SecretBytes)> = Vec::with_capacity(count);
+            for _ in 0..count {
+                let name = named(Some(&read_line(r)?))?;
+                if items.iter().any(|(n, _)| *n == name) {
+                    return Err(invalid("repeated secret name"));
+                }
+                let len = read_len(r, 1, MAX_SECRET)?;
+                let mut value = SecretBytes::zeroed(len);
+                r.read_exact(&mut value)?;
+                items.push((name, value));
+            }
+            let list = items.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(",");
+            Ok(Request::SetMany(list, items))
+        }
         ("SET", n) => {
             let name = named(n)?;
             let len = read_len(r, 1, MAX_SECRET)?;
@@ -130,6 +158,13 @@ pub fn write_request(w: &mut impl Write, req: &Request) -> io::Result<()> {
         Request::Get(n) => writeln!(w, "GET {n}")?,
         Request::Rm(n) => writeln!(w, "RM {n}")?,
         Request::Allow(list, secs) => writeln!(w, "ALLOW {list} {secs}")?,
+        Request::SetMany(_, items) => {
+            writeln!(w, "SETMANY {}", items.len())?;
+            for (n, v) in items {
+                write!(w, "{n}\n{}\n", v.len())?;
+                w.write_all(v)?;
+            }
+        }
         Request::Set(n, v) => {
             write!(w, "SET {n}\n{}\n", v.len())?;
             w.write_all(v)?;
@@ -191,6 +226,14 @@ mod tests {
             Request::Set(n, v) => assert_eq!((n.as_str(), &v[..]), ("github", &b"a\nb"[..])),
             _ => panic!(),
         }
+        let items = vec![("a".into(), SecretBytes::from_slice(b"1")), ("b".into(), SecretBytes::from_slice(b"22"))];
+        match roundtrip(Request::SetMany("a,b".into(), items)) {
+            Request::SetMany(l, items) => {
+                assert_eq!(l, "a,b");
+                assert_eq!(&items[1].1[..], b"22");
+            }
+            _ => panic!(),
+        }
         assert!(matches!(roundtrip(Request::Allow("github,aws.prod".into(), 3600)),
             Request::Allow(l, 3600) if l == "github,aws.prod"));
     }
@@ -201,7 +244,8 @@ mod tests {
             assert!(read_request(&mut &raw[..]).is_err(), "{raw:?}");
         }
         for raw in ["ALLOW github\n", "ALLOW github 0\n", "ALLOW github 43201\n", "ALLOW github,github 60\n",
-            "ALLOW github, 60\n", "ALLOW ,github 60\n", "ALLOW Git 60\n", "ALLOW github -5\n"] {
+            "ALLOW github, 60\n", "ALLOW ,github 60\n", "ALLOW Git 60\n", "ALLOW github -5\n",
+            "SETMANY 0\n", "SETMANY 33\n", "SETMANY 2\na\n1\nxa\n1\ny", "SETMANY 1\nBad\n1\nx"] {
             assert!(read_request(&mut raw.as_bytes()).is_err(), "{raw:?}");
         }
         let long = format!("GET {}\n", "a".repeat(400));

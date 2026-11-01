@@ -360,10 +360,31 @@ fn scan_finds_and_import_stores() {
     assert_eq!(code, 0, "{err}");
     assert!(err.contains("stored github") && err.contains("plain copy is still"), "{err}");
     assert_eq!(env.client(&["get", "github"], b"").1, token);
-    assert_eq!(env.client(&["import", &spec, "gh-work"], b"").0, 0);
-    assert_eq!(env.client(&["list"], b"").1, "gh-work\ngithub\n");
+    let (code, _, err) = env.client(&["import", &spec], b"");
+    assert_eq!(code, 1, "never overwrites");
+    assert!(err.contains("github is already stored"), "{err}");
     let line1 = format!("{}:1", proj.join(".env").display());
     assert_eq!(env.client(&["import", &line1], b"").0, 1, "nothing on line 1");
+
+    // Several at once: one prompt, one write.
+    let npmrc = format!("{}:1", env.path("home/.npmrc").display());
+    let before = read(&env.path("approvals")).lines().count();
+    let (code, _, err) = env.client(&["import", &format!("{spec}=gh-work"), &npmrc], b"");
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("stored gh-work,npm"), "{err}");
+    assert_eq!(read(&env.path("approvals")).lines().count(), before + 1, "one prompt for the batch");
+    assert!(read(&env.path("approvals")).contains("dev.agent-keychain.write gh-work,npm"));
+    assert_eq!(env.client(&["list"], b"").1, "gh-work\ngithub\nnpm\n");
+    assert_eq!(env.client(&["get", "npm"], b"").1, "npm_abcdefghijklmnop1234");
+    let (code, _, err) = env.client(&["import", &format!("{spec}=x"), &format!("{npmrc}=x")], b"");
+    assert_eq!(code, 1);
+    assert!(err.contains("both be named x"), "{err}");
+
+    // Denied batch stores nothing.
+    fs::write(env.path("deny"), "").unwrap();
+    assert_eq!(env.client(&["import", &format!("{spec}=d1"), &format!("{npmrc}=d2")], b"").0, 2);
+    fs::remove_file(env.path("deny")).unwrap();
+    assert_eq!(env.client(&["list"], b"").1, "gh-work\ngithub\nnpm\n");
     assert!(read(&proj.join(".env")).contains(token), "file left as it was");
 }
 

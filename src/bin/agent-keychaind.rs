@@ -305,6 +305,17 @@ fn respond(sh: &Shared, req: &Request, peer: &Peer, caller: &str, sock: RawFd, w
                 Err(e) => ("error", proto::write_err(w, &format!("cannot save: {e}"))),
             }
         }
+        Request::SetMany(list, items) => {
+            if let Some(refused) = gate(sh, ACTION_WRITE, list, "", caller, peer, w) {
+                return refused;
+            }
+            let pairs: Vec<(&str, &[u8])> = items.iter().map(|(n, v)| (n.as_str(), &v[..])).collect();
+            let saved = lock(&sh.vault).set_many(&pairs);
+            match saved {
+                Ok(()) => ("stored", proto::write_ok(w, b"")),
+                Err(e) => ("error", proto::write_err(w, &format!("cannot save: {e}"))),
+            }
+        }
         Request::Allow(list, secs) => {
             let absent = {
                 let vault = lock(&sh.vault);

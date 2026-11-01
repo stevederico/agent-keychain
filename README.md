@@ -41,7 +41,8 @@ agent-keychain rm github         # delete, needs approval
 agent-keychain log               # recent requests (--json for scripts)
 agent-keychain skill             # guide for AI agents: point your agent here
 agent-keychain scan              # optional: find keys in plain files (.env, ~/.npmrc, ...)
-agent-keychain import ~/.npmrc:5 # optional: store one that scan found
+agent-keychain import ~/.npmrc:5 ~/proj/.env:2=github   # optional: store what scan found, one approval
+agent-keychain import --all      # optional: store everything scan finds
 agent-keychain with github,npm --for 2h -- claude   # ask once, then no prompts for these
 
 GITHUB_TOKEN=$(agent-keychain get github) gh pr list

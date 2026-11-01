@@ -58,15 +58,27 @@ impl Vault {
     }
 
     pub fn set(&mut self, name: &str, value: &[u8]) -> io::Result<()> {
-        let mut nonce = [0u8; NONCE_LEN];
-        crypto::random(&mut nonce)?;
-        let sealed = crypto::seal(&self.key, &nonce, &aad(name), value);
-        let old = self.entries.insert(name.to_string(), Entry { nonce, sealed });
+        self.set_many(&[(name, value)])
+    }
+
+    /// Stores several secrets with one write: all of them, or on error none.
+    pub fn set_many(&mut self, items: &[(&str, &[u8])]) -> io::Result<()> {
+        let mut sealed = Vec::with_capacity(items.len());
+        for (name, value) in items {
+            let mut nonce = [0u8; NONCE_LEN];
+            crypto::random(&mut nonce)?;
+            let entry = Entry { nonce, sealed: crypto::seal(&self.key, &nonce, &aad(name), value) };
+            sealed.push((name.to_string(), entry));
+        }
+        let old: Vec<(String, Option<Entry>)> =
+            sealed.into_iter().map(|(n, e)| (n.clone(), self.entries.insert(n, e))).collect();
         if let Err(e) = self.save() {
-            match old {
-                Some(o) => self.entries.insert(name.to_string(), o),
-                None => self.entries.remove(name),
-            };
+            for (name, prev) in old.into_iter().rev() {
+                match prev {
+                    Some(p) => self.entries.insert(name, p),
+                    None => self.entries.remove(&name),
+                };
+            }
             return Err(e);
         }
         Ok(())
@@ -187,6 +199,18 @@ mod tests {
         assert_eq!(&v.get("github").unwrap().unwrap()[..], b"ghp_secret");
 
         assert!(Vault::open(path, key(2)).is_err(), "wrong key must fail to open");
+    }
+
+    #[test]
+    fn set_many_is_one_write() {
+        let path = std::env::temp_dir().join(format!("akc-many-{}", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let mut v = Vault::open(path.clone(), key(5)).unwrap();
+        v.set_many(&[("a", b"1"), ("b", b"22")]).unwrap();
+        let v = Vault::open(path.clone(), key(5)).unwrap();
+        assert_eq!(v.names().collect::<Vec<_>>(), ["a", "b"]);
+        assert_eq!(&v.get("b").unwrap().unwrap()[..], b"22");
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
