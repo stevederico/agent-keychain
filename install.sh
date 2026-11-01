@@ -22,6 +22,7 @@ install -Dm755 target/release/agent-keychain /usr/bin/agent-keychain
 install -Dm644 dist/agent-keychain.sysusers /usr/lib/sysusers.d/agent-keychain.conf
 install -Dm644 dist/dev.agent-keychain.policy /usr/share/polkit-1/actions/dev.agent-keychain.policy
 install -Dm644 SPEC.md /usr/share/doc/agent-keychain/SPEC.md
+install -Dm644 LICENSE /usr/share/licenses/agent-keychain/LICENSE
 install -Dm644 LICENSES/libsodium.txt /usr/share/licenses/agent-keychain/libsodium.txt
 sed "s/@OWNER_UID@/$owner_uid/" dist/agent-keychaind.service >/etc/systemd/system/agent-keychaind.service
 chmod 644 /etc/systemd/system/agent-keychaind.service

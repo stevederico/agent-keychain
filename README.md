@@ -92,3 +92,7 @@ See [SPEC.md](SPEC.md) for the full threat model, including what it does not cov
 - Bitwarden: [MCP server](https://www.businesswire.com/news/home/20250710815039/en/Bitwarden-Brings-Agentic-AI-to-Secure-Credential-Management), [Agent Access SDK](https://secure.businesswire.com/news/home/20260324779404/en/Bitwarden-Introduces-Open-Standard-to-Secure-Agent-Credential-Access-with-the-Agent-Access-SDK), [community post](https://community.bitwarden.com/t/stop-giving-ai-agents-the-keys-to-everything-introducing-the-agent-access-sdk/95244)
 - Infisical: [Agent Vault](https://infisical.com/platform/agent-vault), [credential brokering](https://infisical.com/blog/credential-brokering-for-ai-agents.md), [wiki](https://github.com/Infisical/agent-vault/wiki)
 - Doppler and others: [secret tools for AI agents, 2026](https://fast.io/resources/best-secret-management-tools-ai-agents/)
+
+## License
+
+MIT, see [LICENSE](LICENSE). The crypto is ported from libsodium (ISC), notice in [LICENSES/libsodium.txt](LICENSES/libsodium.txt).
