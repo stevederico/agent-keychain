@@ -17,6 +17,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 const SOCKET: &str = "/run/agent-keychain/sock";
 const DEFAULT_ALLOW_SECS: u64 = 3600;
+/// How-to for AI agents, printed by `skill`. Ships in the binary, so it always matches.
+const SKILL: &str = include_str!("../skill.md");
 const EXIT_DENIED: u8 = 2;
 const EXIT_USAGE: u8 = 64;
 
@@ -26,9 +28,10 @@ const USAGE: &str = "usage: agent-keychain <command> [name]
 commands:
   set <name>   store a secret, from stdin or a hidden prompt (asks you to approve)
   get <name>   print a secret (asks you to approve)
-  list         list secret names
+  list         list secret names (--json for a JSON array)
   rm <name>    delete a secret (asks you to approve)
-  log          show recent requests
+  log          show recent requests (--json for an array of objects)
+  skill        print the guide for AI agents (start here if you are one)
   with <names> <program>
                run a program that may get these secrets without a prompt, along
                with everything it starts, for 1h or --for (30m, 2h, at most 12h).
@@ -79,15 +82,20 @@ fn run() -> Result<ExitCode, String> {
     }
     let args: Vec<String> = env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let json = matches!(args.as_slice(), ["list" | "log", "--json"]);
     let req = match args.as_slice() {
-        ["list"] => Request::List,
-        ["log"] => Request::Log,
+        ["list"] | ["list", "--json"] => Request::List,
+        ["log"] | ["log", "--json"] => Request::Log,
         ["get", n] => Request::Get(name(n)?),
         ["rm", n] => Request::Rm(name(n)?),
         ["set", n] => {
             let n = name(n)?;
             let value = read_secret(&n)?;
             Request::Set(n, value)
+        }
+        ["skill"] => {
+            print!("{SKILL}");
+            return Ok(ExitCode::SUCCESS);
         }
         ["-h" | "--help" | "help"] => {
             println!("{USAGE}");
@@ -101,7 +109,7 @@ fn run() -> Result<ExitCode, String> {
 
     match request(&req)? {
         Response::Ok(data) => {
-            print_ok(&req, &data).map_err(|e| e.to_string())?;
+            print_ok(&req, &data, json).map_err(|e| e.to_string())?;
             Ok(ExitCode::SUCCESS)
         }
         Response::Denied => {
@@ -176,8 +184,17 @@ fn parse_duration(s: &str) -> Result<u64, String> {
     }
 }
 
-fn print_ok(req: &Request, data: &[u8]) -> io::Result<()> {
+fn print_ok(req: &Request, data: &[u8], json: bool) -> io::Result<()> {
     let mut out = io::stdout().lock();
+    if json {
+        let text = String::from_utf8_lossy(data);
+        let items: Vec<String> = match req {
+            Request::List => text.lines().map(json_string).collect(),
+            _ => text.lines().map(log_json).collect(),
+        };
+        writeln!(out, "[{}]", items.join(","))?;
+        return out.flush();
+    }
     match req {
         Request::Get(_) => {
             out.write_all(data)?;
@@ -196,6 +213,43 @@ fn print_ok(req: &Request, data: &[u8]) -> io::Result<()> {
         Request::Allow(..) => {}
     }
     out.flush()
+}
+
+fn json_string(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// One daemon log line as a JSON object. The daemon writes
+/// `TIME VERB NAME uid=UID pid=PID caller="CALLER" OUTCOME`; anything else becomes {"raw": ...}.
+fn log_json(line: &str) -> String {
+    let parse = || {
+        let (time, rest) = line.split_once(' ')?;
+        let (verb, rest) = rest.split_once(' ')?;
+        let (name, rest) = rest.split_once(' ')?;
+        let (uid, rest) = rest.strip_prefix("uid=")?.split_once(' ')?;
+        let (pid, rest) = rest.strip_prefix("pid=")?.split_once(' ')?;
+        let (caller, outcome) = rest.strip_prefix("caller=\"")?.rsplit_once("\" ")?;
+        let (uid, pid): (u32, i32) = (uid.parse().ok()?, pid.parse().ok()?);
+        let name = if name == "-" { "null".to_string() } else { json_string(name) };
+        Some(format!(
+            "{{\"time\":{},\"request\":{},\"name\":{name},\"uid\":{uid},\"pid\":{pid},\"caller\":{},\"outcome\":{}}}",
+            json_string(time),
+            json_string(verb),
+            json_string(caller),
+            json_string(outcome)
+        ))
+    };
+    parse().unwrap_or_else(|| format!("{{\"raw\":{}}}", json_string(line)))
 }
 
 fn is_tty(fd: c_int) -> bool {

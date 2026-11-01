@@ -36,9 +36,10 @@ Safe to rerun. The vault and its key are never touched.
 ```
 agent-keychain set github        # store (prompt or stdin), needs approval
 agent-keychain get github        # print, needs approval
-agent-keychain list              # names only
+agent-keychain list              # names only (--json for scripts)
 agent-keychain rm github         # delete, needs approval
-agent-keychain log               # recent requests
+agent-keychain log               # recent requests (--json for scripts)
+agent-keychain skill             # guide for AI agents: point your agent here
 agent-keychain with github,npm --for 2h -- claude   # ask once, then no prompts for these
 
 GITHUB_TOKEN=$(agent-keychain get github) gh pr list

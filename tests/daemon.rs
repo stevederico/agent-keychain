@@ -170,6 +170,16 @@ fn full_flow() {
         assert!(log.contains(want), "log lacks {want:?}:\n{log}");
     }
     assert!(!log.contains("ghp_test123") && !log.contains("sk_test_456"));
+
+    // JSON for scripts and agents.
+    assert_eq!(env.client(&["list", "--json"], b"").1, "[\"github\"]\n");
+    let (code, json, _) = env.client(&["log", "--json"], b"");
+    assert_eq!(code, 0);
+    assert!(json.starts_with("[{\"time\":\"") && json.ends_with("}]\n"), "{json}");
+    assert!(json.contains("\"request\":\"GET\",\"name\":\"github\""), "{json}");
+    assert!(json.contains("\"request\":\"LIST\",\"name\":null"), "{json}");
+    assert!(json.contains("\"caller\":\"agent-keychain"), "{json}");
+    assert!(!json.contains("\"raw\""), "every line parses: {json}");
 }
 
 #[test]
@@ -320,6 +330,16 @@ fn bad_input() {
     assert_eq!(env.client(&["set", "github"], b"").0, 1, "empty secret");
     assert_eq!(env.client(&["set", "github"], &vec![b'x'; 16 * 1024 + 1]).0, 1, "too long");
     assert_eq!(env.client(&["set", "github"], &vec![b'x'; 16 * 1024]).0, 0, "limit fits");
+}
+
+#[test]
+fn skill_prints_agent_guide() {
+    let out = Command::new(CLIENT).arg("skill").output().unwrap();
+    assert!(out.status.success());
+    let guide = String::from_utf8(out.stdout).unwrap();
+    for want in ["agent-keychain get", "Exit codes", "Never print", "agent-keychain with"] {
+        assert!(guide.contains(want), "guide lacks {want:?}");
+    }
 }
 
 #[test]

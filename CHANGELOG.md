@@ -2,6 +2,11 @@
 - Consider 1-hour approval
 - Add proxy mode (agent never sees secret; plug into cloak/OneCLI or own TLS)
 
+0.14.0
+
+  Add skill command
+  Add JSON output
+
 0.13.0
 
   Document updating

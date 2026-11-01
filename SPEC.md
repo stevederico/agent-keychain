@@ -68,9 +68,10 @@ The main threat is a program running as the user that reads secrets without aski
 | --- | --- |
 | `agent-keychain set github` | Store a secret, read from stdin or a hidden prompt. Needs approval |
 | `agent-keychain get github` | Print the secret to stdout after approval |
-| `agent-keychain list` | Names only, never values |
+| `agent-keychain list` | Names only, never values. `--json` for a JSON array |
 | `agent-keychain rm github` | Delete a secret. Needs approval |
-| `agent-keychain log` | Show recent requests |
+| `agent-keychain log` | Show recent requests. `--json` for an array of objects |
+| `agent-keychain skill` | Print the guide for AI agents, built into the binary |
 | `agent-keychain with github --for 2h -- claude` | Run a program that may `get` these secrets without a prompt. Asks once |
 
 Agent use: `GITHUB_TOKEN=$(agent-keychain get github) gh pr list`
