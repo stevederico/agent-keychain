@@ -3,13 +3,14 @@
 use agent_keychain::crypto::{SecretBytes, wipe};
 use agent_keychain::names::valid_name;
 use agent_keychain::proto::{self, MAX_SECRET, Request, Response};
+use agent_keychain::scan;
 use agent_keychain::sys;
 use std::env;
 use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::raw::c_int;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitCode};
 use std::sync::OnceLock;
@@ -32,6 +33,11 @@ commands:
   rm <name>    delete a secret (asks you to approve)
   log          show recent requests (--json for an array of objects)
   skill        print the guide for AI agents (start here if you are one)
+  scan [dir]   find secrets in plain files (.env, shell config, ~/.npmrc, ...).
+               Read only; shows where, never the values. --json for scripts
+  import <file>:<line> [name]
+               store a secret that scan found (asks you to approve).
+               The file is left as it is
   with <names> <program>
                run a program that may get these secrets without a prompt, along
                with everything it starts, for 1h or --for (30m, 2h, at most 12h).
@@ -93,6 +99,9 @@ fn run() -> Result<ExitCode, String> {
             let value = read_secret(&n)?;
             Request::Set(n, value)
         }
+        ["scan", rest @ ..] => return scan_cmd(rest),
+        ["import", spec] => import(spec, None)?,
+        ["import", spec, n] => import(spec, Some(n))?,
         ["skill"] => {
             print!("{SKILL}");
             return Ok(ExitCode::SUCCESS);
@@ -208,11 +217,98 @@ fn print_ok(req: &Request, data: &[u8], json: bool) -> io::Result<()> {
                 out.write_all(b"\n")?;
             }
         }
-        Request::Set(n, _) => eprintln!("stored {n}"),
+        Request::Set(n, _) => {
+            eprintln!("stored {n}");
+            if matches!(env::args().nth(1).as_deref(), Some("import")) {
+                eprintln!("The plain copy is still in that file. Remove it once nothing reads it from there.");
+            }
+        }
         Request::Rm(n) => eprintln!("removed {n}"),
         Request::Allow(..) => {}
     }
     out.flush()
+}
+
+fn home() -> Result<PathBuf, String> {
+    env::var_os("HOME").map(PathBuf::from).ok_or_else(|| "HOME is not set".to_string())
+}
+
+/// `/home/me/x` -> `~/x`, for display.
+fn tilde(p: &Path) -> String {
+    match home().ok().and_then(|h| p.strip_prefix(&h).ok().map(Path::to_path_buf)) {
+        Some(rest) => format!("~/{}", rest.display()),
+        None => p.display().to_string(),
+    }
+}
+
+/// `~/x` -> `/home/me/x`.
+fn untilde(s: &str) -> Result<PathBuf, String> {
+    match s.strip_prefix("~/") {
+        Some(rest) => Ok(home()?.join(rest)),
+        None => Ok(PathBuf::from(s)),
+    }
+}
+
+fn scan_cmd(args: &[&str]) -> Result<ExitCode, String> {
+    let json = args.contains(&"--json");
+    let dirs: Vec<&str> = args.iter().copied().filter(|a| *a != "--json").collect();
+    let files = if dirs.is_empty() {
+        scan::home_files(&home()?)
+    } else {
+        dirs.iter().map(|d| untilde(d)).collect::<Result<Vec<_>, _>>()?.iter().flat_map(|d| scan::candidate_files(d, 8)).collect()
+    };
+    let found = scan::scan_files(&files);
+    let mut out = io::stdout().lock();
+    let write = |out: &mut io::StdoutLock, s: String| out.write_all(s.as_bytes()).map_err(|e| e.to_string());
+    if json {
+        let items: Vec<String> = found
+            .iter()
+            .map(|f| {
+                format!(
+                    "{{\"path\":{},\"line\":{},\"var\":{},\"preview\":{},\"name\":{}}}",
+                    json_string(&f.path.to_string_lossy()),
+                    f.line,
+                    f.var.as_deref().map_or("null".into(), json_string),
+                    json_string(&f.preview()),
+                    json_string(&f.suggested_name())
+                )
+            })
+            .collect();
+        write(&mut out, format!("[{}]\n", items.join(",")))?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    for f in &found {
+        let place = format!("{}:{}", tilde(&f.path), f.line);
+        let var = f.var.as_deref().unwrap_or("-");
+        write(&mut out, format!("{place}  {var}  {}  -> {}\n", f.preview(), f.suggested_name()))?;
+    }
+    let files_hit = {
+        let mut p: Vec<&Path> = found.iter().map(|f| f.path.as_path()).collect();
+        p.dedup();
+        p.len()
+    };
+    match found.first() {
+        None => eprintln!("no secrets found in {} files", files.len()),
+        Some(f) => eprintln!(
+            "{} secrets in {files_hit} files. Store one: agent-keychain import {}:{} [name]",
+            found.len(),
+            tilde(&f.path),
+            f.line
+        ),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The SET request for a secret scan found at `file:line`.
+fn import(spec: &str, name_arg: Option<&str>) -> Result<Request, String> {
+    let (file, line) = spec.rsplit_once(':').ok_or("use <file>:<line>, as scan prints it")?;
+    let line: usize = line.parse().map_err(|_| format!("bad line number in {spec:?}"))?;
+    let path = untilde(file)?;
+    let found = scan::finding_at(&path, line).map_err(|e| e.to_string())?;
+    let n = name(name_arg.map_or(found.suggested_name(), str::to_string).as_str())?;
+    eprintln!("importing {} from {spec} as {n}", found.preview());
+    let value = SecretBytes::from_slice(found.value.as_bytes());
+    Ok(Request::Set(n, value))
 }
 
 fn json_string(s: &str) -> String {

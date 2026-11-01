@@ -333,6 +333,41 @@ fn bad_input() {
 }
 
 #[test]
+fn scan_finds_and_import_stores() {
+    let mut env = Env::new("scan");
+    env.start(current_uid());
+    let token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+    let proj = env.path("home/proj");
+    fs::create_dir_all(&proj).unwrap();
+    fs::create_dir_all(env.path("home/node_modules/x")).unwrap();
+    fs::write(proj.join(".env"), format!("NODE_ENV=dev\nGITHUB_TOKEN={token}\n")).unwrap();
+    fs::write(proj.join(".env.example"), format!("GITHUB_TOKEN={token}\n")).unwrap();
+    fs::write(env.path("home/node_modules/x/.env"), format!("GITHUB_TOKEN={token}\n")).unwrap();
+    fs::write(env.path("home/.npmrc"), "//registry.npmjs.org/:_authToken=npm_abcdefghijklmnop1234\n").unwrap();
+    let home = env.path("home").to_string_lossy().into_owned();
+
+    let (code, out, err) = env.client(&["scan", &home], b"");
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out.lines().count(), 2, "skips .env.example and node_modules:\n{out}");
+    assert!(out.contains("proj/.env:2  GITHUB_TOKEN  ghp_…6789  -> github"), "{out}");
+    assert!(out.contains(".npmrc:1") && out.contains("-> npm"), "{out}");
+    assert!(!out.contains(token) && !err.contains(token), "never prints values");
+    let (_, json, _) = env.client(&["scan", "--json", &home], b"");
+    assert!(json.contains("\"line\":2,\"var\":\"GITHUB_TOKEN\",\"preview\":\"ghp_…6789\",\"name\":\"github\""), "{json}");
+
+    let spec = format!("{}:2", proj.join(".env").display());
+    let (code, _, err) = env.client(&["import", &spec], b"");
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("stored github") && err.contains("plain copy is still"), "{err}");
+    assert_eq!(env.client(&["get", "github"], b"").1, token);
+    assert_eq!(env.client(&["import", &spec, "gh-work"], b"").0, 0);
+    assert_eq!(env.client(&["list"], b"").1, "gh-work\ngithub\n");
+    let line1 = format!("{}:1", proj.join(".env").display());
+    assert_eq!(env.client(&["import", &line1], b"").0, 1, "nothing on line 1");
+    assert!(read(&proj.join(".env")).contains(token), "file left as it was");
+}
+
+#[test]
 fn skill_prints_agent_guide() {
     let out = Command::new(CLIENT).arg("skill").output().unwrap();
     assert!(out.status.success());

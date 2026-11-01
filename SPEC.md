@@ -72,6 +72,8 @@ The main threat is a program running as the user that reads secrets without aski
 | `agent-keychain rm github` | Delete a secret. Needs approval |
 | `agent-keychain log` | Show recent requests. `--json` for an array of objects |
 | `agent-keychain skill` | Print the guide for AI agents, built into the binary |
+| `agent-keychain scan [dir]` | Optional. Find secrets in plain files: `.env` files, shell config, `~/.npmrc`, `~/.aws/credentials`, `~/.netrc`, `~/.git-credentials`, `~/.config/gh/hosts.yml`, `~/.docker/config.json`. Read only, runs as the user, sends nothing anywhere. Shows file, line, variable and a preview (known prefix and last 4), never the value. Skips hidden and dependency folders |
+| `agent-keychain import <file>:<line> [name]` | Optional. Store a secret `scan` found; a normal `set`, so it needs approval. Never edits the file: the plain copy stays until the user removes it |
 | `agent-keychain with github --for 2h -- claude` | Run a program that may `get` these secrets without a prompt. Asks once |
 
 Agent use: `GITHUB_TOKEN=$(agent-keychain get github) gh pr list`

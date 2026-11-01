@@ -44,5 +44,6 @@ They approve once; you and your child processes then get `github` without prompt
 
 ## Do not
 
-- Do not run `set` or `rm` unless the user asked you to change secrets
+- Do not run `set`, `rm` or `import` unless the user asked you to change secrets
+- `agent-keychain scan` is the user's tool for finding keys in plain files; run it only when asked
 - Do not try to read secrets from other processes or from the vault files
