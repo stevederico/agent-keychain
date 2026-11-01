@@ -1,7 +1,12 @@
-- Write daemon binary
-- Write CLI binary
-- Add install files
-- Add integration tests
+- Test real polkit install
+- Consider 1-hour approval
+
+0.4.0
+
+  Add daemon
+  Add CLI
+  Add install scripts
+  Add end-to-end tests
 
 0.3.0
 

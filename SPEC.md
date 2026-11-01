@@ -28,7 +28,8 @@ The main threat is a program running as the user that reads secrets without aski
 1. `agent-keychaind` runs as system user `agent-keychain` (systemd service, hardened: `ProtectHome`, `NoNewPrivileges`, `MemoryDenyWriteExecute`, no network)
 2. It listens on `/run/agent-keychain/sock`, writable only by the user's group
 3. A client sends `get github`
-4. The daemon reads the caller with `SO_PEERCRED` (uid, pid) and `/proc/<pid>/exe`
+4. The daemon reads the caller with `SO_PEERCRED` (uid, pid) and refuses any uid but the owner's
+   - It names the caller from `/proc/<pid>/comm` up the parent chain (`agent-keychain <- zsh <- claude`). Processes pick their own names, so this is a hint, not proof
 5. It asks polkit to authorize action `dev.agent-keychain.read` for that caller; polkit shows the password prompt
 6. Approved: it returns the secret over the socket and logs it. Denied: it returns an error and logs it
 
@@ -70,15 +71,16 @@ Agent use: `GITHUB_TOKEN=$(agent-keychain get github) gh pr list`
 
 ## Approval rules
 
-- **Once**: default. One prompt per read
-- **For 1 hour**: same caller (exe path) and same secret skip the prompt for 60 minutes
-- **Deny**: returns an error; the agent sees "denied"
-- Log line: time, secret name, caller exe, pid, result
+- **Once**: every `get`, `set` and `rm` prompts (polkit `auth_self`). `list` and `log` never show values and don't prompt
+- **Deny**: the client exits 2 and prints nothing
+- Log line: time, request, secret name, uid, pid, caller chain, outcome. Never values
+- Not built yet: "approve for 1 hour"
 
 ## Open questions
 
 - Can the polkit prompt show which secret and caller is asking, clearly enough to trust?
-- Is "for 1 hour" worth the risk, or always prompt?
+- Add "approve for 1 hour", or keep always-prompt?
+- Confirm on a real install: polkit honors the `org.freedesktop.policykit.owner` annotation for the daemon user
 - Packaging: a PKGBUILD for omarchy-pkgs, or local only?
 
 ## Out of scope

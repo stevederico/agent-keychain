@@ -1,0 +1,47 @@
+[Unit]
+Description=agent-keychain: secrets for AI agents, approved by you
+Documentation=file:///usr/share/doc/agent-keychain/SPEC.md
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/agent-keychaind
+User=agent-keychain
+Group=agent-keychain
+Environment=AGENT_KEYCHAIN_OWNER_UID=@OWNER_UID@
+LoadCredentialEncrypted=vault-key:/etc/credstore.encrypted/agent-keychain.vault-key
+StateDirectory=agent-keychain
+StateDirectoryMode=0700
+RuntimeDirectory=agent-keychain
+RuntimeDirectoryMode=0755
+UMask=0077
+Restart=on-failure
+
+# Secrets never reach swap or a core dump.
+MemorySwapMax=0
+LimitCORE=0
+
+# Sandbox: no privileges, no network, read-only system, no home directories.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
