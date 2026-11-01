@@ -13,7 +13,9 @@ use std::collections::HashMap;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::raw::c_ulong;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::linux::net::SocketAddrExt;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::net::{SocketAddr, UnixDatagram, UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
@@ -129,6 +131,7 @@ fn run() -> Result<(), String> {
     fs::set_permissions(&cfg.socket, fs::Permissions::from_mode(0o666))
         .map_err(|e| format!("{}: {e}", cfg.socket.display()))?;
     eprintln!("agent-keychaind: serving uid {} on {}", cfg.owner_uid, cfg.socket.display());
+    notify_ready();
 
     let shared = Arc::new(Shared {
         cfg,
@@ -152,6 +155,19 @@ fn run() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Tells systemd the socket is up (Type=notify), so `systemctl start` returns only once
+/// clients can connect. Does nothing outside systemd.
+fn notify_ready() {
+    let Some(path) = env::var_os("NOTIFY_SOCKET") else { return };
+    let sent = UnixDatagram::unbound().and_then(|sock| match path.as_bytes().strip_prefix(b"@") {
+        Some(name) => sock.send_to_addr(b"READY=1", &SocketAddr::from_abstract_name(name)?),
+        None => sock.send_to(b"READY=1", &path),
+    });
+    if let Err(e) = sent {
+        eprintln!("agent-keychaind: notify systemd: {e}");
+    }
 }
 
 fn load_key(cfg: &Config) -> Result<Key, String> {

@@ -272,6 +272,20 @@ fn with_bad_input() {
 }
 
 #[test]
+fn tells_systemd_when_ready() {
+    let env = Env::new("notify");
+    let notify = std::os::unix::net::UnixDatagram::bind(env.path("notify")).unwrap();
+    notify.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut daemon = env.daemon_cmd(current_uid()).env("NOTIFY_SOCKET", env.path("notify")).spawn().unwrap();
+    let mut buf = [0u8; 64];
+    let n = notify.recv(&mut buf).unwrap();
+    assert_eq!(&buf[..n], b"READY=1");
+    assert!(env.path("sock").exists(), "ready only once the socket is up");
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+}
+
+#[test]
 fn wrong_key_refuses_to_start() {
     let mut env = Env::new("wrongkey");
     env.start(current_uid());

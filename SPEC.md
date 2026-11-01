@@ -91,11 +91,15 @@ Agent use: `GITHUB_TOKEN=$(agent-keychain get github) gh pr list`
   - Only `get`. `set` and `rm` always prompt. Other secrets and other programs still prompt
   - Grants live in the daemon's memory only; a restart drops them
 
+## Confirmed on a real install (2026-11-01, Omarchy)
+
+- The polkit prompt shows the secret and caller: `"agent-keychain ← bash ← ghostty ← Hyprland" wants to change the secret "github"`
+- polkit honors the `org.freedesktop.policykit.owner` annotation, so the daemon user may pass those details
+- `with` works across users: one prompt, then `allowed-by-grant` for the program and its children
+
 ## Open questions
 
-- Can the polkit prompt show which secret and caller is asking, clearly enough to trust? Omarchy's shell polkit agent shows the action message, which carries both, if polkit accepts the details (see the owner annotation below)
 - Proxy mode: hand the agent a placeholder and swap in the real secret on its outgoing HTTPS requests, so the agent never holds it. Needs TLS (breaks the zero-crate rule or means a port) or plugging into an existing proxy (cloak, OneCLI, Infisical Agent Vault)
-- Confirm on a real install: polkit honors the `org.freedesktop.policykit.owner` annotation for the daemon user
 - Packaging: a PKGBUILD for omarchy-pkgs, or local only?
 
 ## Out of scope

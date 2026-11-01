@@ -3,7 +3,7 @@ Description=agent-keychain: secrets for AI agents, approved by you
 Documentation=file:///usr/share/doc/agent-keychain/SPEC.md
 
 [Service]
-Type=simple
+Type=notify
 ExecStart=/usr/bin/agent-keychaind
 User=agent-keychain
 Group=agent-keychain
