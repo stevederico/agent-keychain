@@ -42,6 +42,10 @@ fn socket_path() -> PathBuf {
 }
 
 fn main() -> ExitCode {
+    // Other processes of this user cannot read our memory, environment or file
+    // descriptors (/proc/<pid>/environ, /proc/<pid>/fd), where a secret passes through.
+    // SAFETY: prctl(PR_SET_DUMPABLE, 0) has no pointer arguments.
+    unsafe { sys::prctl(sys::PR_SET_DUMPABLE, 0 as std::os::raw::c_ulong) };
     match run() {
         Ok(code) => code,
         Err(e) => {

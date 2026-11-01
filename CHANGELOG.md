@@ -1,6 +1,11 @@
 - Test real polkit install
 - Consider 1-hour approval
 
+0.7.0
+
+  Hide client from /proc
+  Document agent isolation
+
 0.6.0
 
   Add prompt lock
