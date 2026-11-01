@@ -1,6 +1,13 @@
 - Test real polkit install
 - Consider 1-hour approval
 
+0.6.0
+
+  Add prompt lock
+  Add denial backoff
+  Expand threat model
+  Drop unused code
+
 0.5.0
 
   Log every request

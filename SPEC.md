@@ -19,6 +19,10 @@ The main threat is a program running as the user that reads secrets without aski
 | A program running as the user reads the store | Yes | Files and memory belong to a separate system user |
 | An agent fakes the approval click (wtype, ydotool) | Yes | Approval needs the login password, which the agent doesn't have |
 | An agent pretends to be another agent | Partly | The caller's uid and pid come from the kernel (`SO_PEERCRED`), but its name comes from `/proc/<pid>/comm`, which any process can set |
+| An agent wears the user down with repeated prompts | Yes | One prompt at a time; after a denial, no prompts for 30s, doubling per denial in a row up to 10 min |
+| An agent draws a fake password prompt to phish the login password | No | Any app can draw a lookalike window. Only type the password into the real polkit prompt |
+| An agent reads a secret handed to another process | No | A process running as the user can read another's `/proc/<pid>/environ` and `/proc/<pid>/fd`, so `TOKEN=$(agent-keychain get x) cmd` exposes the token to any other agent of that user |
+| An agent puts a fake `agent-keychain` earlier in `PATH` | No | Pairs with the fake prompt above. Call `/usr/bin/agent-keychain` by full path |
 | An agent leaks a secret after it gets it | No | Out of scope: approval controls who gets a key, not what they do with it |
 | Root, or a hacked kernel | No | Root can read anything |
 | Stolen disk | Yes | Encrypted at rest |
@@ -75,12 +79,15 @@ Agent use: `GITHUB_TOKEN=$(agent-keychain get github) gh pr list`
 - **Deny**: the client exits 2 and prints nothing
 - Log line: time, request, secret name, uid, pid, caller chain, outcome. Never values
 - Logged: every request, including `list`, `log`, other users' refused connections and malformed requests
-- Outcomes: `allowed`, `stored`, `removed`, `listed`, `shown`, `denied`, `missing`, `error` (approval could not run), `refused`, `malformed`
+- Outcomes: `allowed`, `stored`, `removed`, `listed`, `shown`, `denied`, `missing`, `error` (approval could not run), `busy`, `throttled`, `refused`, `malformed`
+- **One at a time**: while a prompt is open, other requests that need approval fail at once (`busy`) instead of queueing
+- **Backoff**: after a denial, requests that need approval fail without a prompt (`throttled`) for 30s (`--deny-backoff`), doubling per denial in a row up to 10 min. Any approval resets it. `list` and `log` are never held back
 - Not built yet: "approve for 1 hour"
 
 ## Open questions
 
-- Can the polkit prompt show which secret and caller is asking, clearly enough to trust?
+- Can the polkit prompt show which secret and caller is asking, clearly enough to trust? Omarchy's shell polkit agent shows the action message, which carries both, if polkit accepts the details (see the owner annotation below)
+- Hand secrets to a file descriptor instead of stdout, so they never sit in another process's environment?
 - Add "approve for 1 hour", or keep always-prompt?
 - Confirm on a real install: polkit honors the `org.freedesktop.policykit.owner` annotation for the daemon user
 - Packaging: a PKGBUILD for omarchy-pkgs, or local only?

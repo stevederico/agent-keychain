@@ -9,7 +9,7 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -19,6 +19,7 @@ const CLIENT: &str = env!("CARGO_BIN_EXE_agent-keychain");
 struct Env {
     dir: PathBuf,
     daemon: Option<Child>,
+    backoff: &'static str,
 }
 
 impl Env {
@@ -27,15 +28,16 @@ impl Env {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("key"), [7u8; 32]).unwrap();
-        // Approves unless a file named "deny" exists; records each call.
+        // Approves unless a file named "deny" exists; records each call. A file named
+        // "slow" holds the prompt open until it is removed.
         let script = format!(
-            "#!/bin/sh\necho \"$1 $2 $3\" >> '{0}/approvals'\n[ -e '{0}/deny' ] && exit 1\nexit 0\n",
+            "#!/bin/sh\necho \"$1 $2 $3\" >> '{0}/approvals'\nwhile [ -e '{0}/slow' ]; do sleep 0.05; done\n[ -e '{0}/deny' ] && exit 1\nexit 0\n",
             dir.display()
         );
         let approver = dir.join("approve.sh");
         fs::write(&approver, script).unwrap();
         fs::set_permissions(&approver, fs::Permissions::from_mode(0o755)).unwrap();
-        Env { dir, daemon: None }
+        Env { dir, daemon: None, backoff: "0" }
     }
 
     /// The socket is relative to `dir` (both processes run there) to stay under the
@@ -45,6 +47,7 @@ impl Env {
         c.current_dir(&self.dir)
             .args(["--socket", "sock", "--state-dir", "state", "--key-file", "key"])
             .args(["--owner-uid", &owner.to_string(), "--approver", "./approve.sh"])
+            .args(["--deny-backoff", self.backoff])
             .stdin(Stdio::null())
             .stderr(Stdio::piped());
         c
@@ -73,6 +76,10 @@ impl Env {
 
     /// Runs the client; returns (exit code, stdout, stderr).
     fn client(&self, args: &[&str], stdin: &[u8]) -> (i32, String, String) {
+        summarize(self.spawn_client(args, stdin).wait_with_output().unwrap())
+    }
+
+    fn spawn_client(&self, args: &[&str], stdin: &[u8]) -> Child {
         let mut child = Command::new(CLIENT)
             .current_dir(&self.dir)
             .env("AGENT_KEYCHAIN_SOCKET", "sock")
@@ -83,12 +90,7 @@ impl Env {
             .spawn()
             .unwrap();
         child.stdin.take().unwrap().write_all(stdin).unwrap();
-        let out = child.wait_with_output().unwrap();
-        (
-            out.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&out.stdout).into_owned(),
-            String::from_utf8_lossy(&out.stderr).into_owned(),
-        )
+        child
     }
 
     fn path(&self, p: &str) -> PathBuf {
@@ -101,6 +103,14 @@ impl Drop for Env {
         self.stop();
         let _ = fs::remove_dir_all(&self.dir);
     }
+}
+
+fn summarize(out: Output) -> (i32, String, String) {
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
 }
 
 fn read(p: &Path) -> String {
@@ -160,6 +170,51 @@ fn full_flow() {
         assert!(log.contains(want), "log lacks {want:?}:\n{log}");
     }
     assert!(!log.contains("ghp_test123") && !log.contains("sk_test_456"));
+}
+
+#[test]
+fn denials_back_off() {
+    let mut env = Env::new("backoff");
+    env.backoff = "60";
+    env.start(current_uid());
+    assert_eq!(env.client(&["set", "github"], b"tok").0, 0);
+
+    fs::write(env.path("deny"), "").unwrap();
+    assert_eq!(env.client(&["get", "github"], b"").0, 2);
+    fs::remove_file(env.path("deny")).unwrap();
+
+    // No prompt during the backoff, even for a request the user would approve.
+    let before = read(&env.path("approvals")).lines().count();
+    let (code, out, err) = env.client(&["get", "github"], b"");
+    assert_eq!((code, out.as_str()), (1, ""), "{err}");
+    assert!(err.contains("try again in"), "{err}");
+    assert_eq!(read(&env.path("approvals")).lines().count(), before, "approver must not run");
+    // Requests that never prompt are not held back.
+    assert_eq!(env.client(&["list"], b"").1, "github\n");
+    assert!(read(&env.path("state/log")).contains("throttled"));
+}
+
+#[test]
+fn one_prompt_at_a_time() {
+    let mut env = Env::new("busy");
+    env.start(current_uid());
+    assert_eq!(env.client(&["set", "github"], b"tok").0, 0);
+
+    fs::write(env.path("slow"), "").unwrap();
+    let first = env.spawn_client(&["get", "github"], b"");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while read(&env.path("approvals")).lines().count() < 2 {
+        assert!(Instant::now() < deadline, "first prompt never opened");
+        sleep(Duration::from_millis(20));
+    }
+    let (code, _, err) = env.client(&["rm", "github"], b"");
+    assert_eq!(code, 1);
+    assert!(err.contains("another approval prompt is open"), "{err}");
+
+    fs::remove_file(env.path("slow")).unwrap();
+    assert_eq!(summarize(first.wait_with_output().unwrap()).1, "tok");
+    assert_eq!(read(&env.path("approvals")).lines().count(), 2, "second request never prompted");
+    assert!(read(&env.path("state/log")).contains("busy"));
 }
 
 #[test]

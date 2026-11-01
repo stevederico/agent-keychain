@@ -93,12 +93,6 @@ impl Drop for SecretBytes {
     }
 }
 
-impl std::fmt::Debug for SecretBytes {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "SecretBytes({} bytes)", self.0.len())
-    }
-}
-
 /// A 32-byte vault key.
 pub struct Key(SecretBytes);
 
@@ -110,6 +104,7 @@ impl Key {
         Ok(Key(SecretBytes::from_slice(bytes)))
     }
 
+    #[cfg(test)]
     pub fn generate() -> io::Result<Key> {
         let mut k = SecretBytes::zeroed(KEY_LEN);
         random(&mut k)?;

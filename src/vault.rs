@@ -15,7 +15,7 @@ use std::path::PathBuf;
 const MAGIC: &[u8; 4] = b"AKC1";
 const AAD_PREFIX: &[u8] = b"agent-keychain:v1:";
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone)]
 pub struct Entry {
     pub nonce: [u8; NONCE_LEN],
     pub sealed: Vec<u8>,

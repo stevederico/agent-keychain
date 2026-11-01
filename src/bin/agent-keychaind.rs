@@ -15,9 +15,9 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const DEFAULT_SOCKET: &str = "/run/agent-keychain/sock";
 const DEFAULT_STATE: &str = "/var/lib/agent-keychain";
@@ -27,13 +27,18 @@ const ACTION_READ: &str = "dev.agent-keychain.read";
 const ACTION_WRITE: &str = "dev.agent-keychain.write";
 const LOG_TAIL: usize = 50;
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_BACKOFF_SECS: u64 = 30;
+const MAX_BACKOFF: Duration = Duration::from_secs(600);
 
 const USAGE: &str = "usage: agent-keychaind [--owner-uid UID] [--socket PATH] [--state-dir DIR]
-                      [--key-file PATH] [--approver PROGRAM]
+                      [--key-file PATH] [--approver PROGRAM] [--deny-backoff SECS]
        agent-keychaind --gen-key   (print 32 random bytes, for systemd-creds)
 
 The owner uid may also come from AGENT_KEYCHAIN_OWNER_UID. Without --key-file the
-vault key is read from the systemd credential \"vault-key\".";
+vault key is read from the systemd credential \"vault-key\".
+
+After a denial, no prompt is shown for --deny-backoff seconds (default 30),
+doubling with each denial in a row, up to 10 minutes.";
 
 struct Config {
     socket: PathBuf,
@@ -44,6 +49,7 @@ struct Config {
     /// pkcheck: 0 approves, 1 or 3 denies, anything else is an error.
     /// Without it, approval goes through polkit.
     approver: Option<PathBuf>,
+    deny_backoff: Duration,
 }
 
 enum Mode {
@@ -58,6 +64,7 @@ fn parse_args() -> Result<Mode, String> {
     let mut key_file = None;
     let mut approver = None;
     let mut owner = env::var("AGENT_KEYCHAIN_OWNER_UID").ok();
+    let mut backoff = DEFAULT_BACKOFF_SECS.to_string();
 
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{arg} needs a value\n\n{USAGE}"));
@@ -68,13 +75,16 @@ fn parse_args() -> Result<Mode, String> {
             "--key-file" => key_file = Some(value()?.into()),
             "--approver" => approver = Some(value()?.into()),
             "--owner-uid" => owner = Some(value()?),
+            "--deny-backoff" => backoff = value()?,
             "-h" | "--help" => return Err(USAGE.into()),
             _ => return Err(format!("unknown argument {arg}\n\n{USAGE}")),
         }
     }
     let owner = owner.ok_or_else(|| format!("no owner uid\n\n{USAGE}"))?;
     let owner_uid = owner.parse().map_err(|_| format!("bad owner uid {owner:?}"))?;
-    Ok(Mode::Run(Config { socket, state_dir, key_file, owner_uid, approver }))
+    let backoff = backoff.parse().map_err(|_| format!("bad --deny-backoff {backoff:?}"))?;
+    let deny_backoff = Duration::from_secs(backoff);
+    Ok(Mode::Run(Config { socket, state_dir, key_file, owner_uid, approver, deny_backoff }))
 }
 
 fn main() -> ExitCode {
@@ -118,7 +128,13 @@ fn run() -> Result<(), String> {
         .map_err(|e| format!("{}: {e}", cfg.socket.display()))?;
     eprintln!("agent-keychaind: serving uid {} on {}", cfg.owner_uid, cfg.socket.display());
 
-    let shared = Arc::new(Shared { cfg, vault: Mutex::new(vault), log: Mutex::new(log) });
+    let shared = Arc::new(Shared {
+        cfg,
+        vault: Mutex::new(vault),
+        log: Mutex::new(log),
+        prompt: Mutex::new(()),
+        backoff: Mutex::new(Backoff::default()),
+    });
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
@@ -152,6 +168,34 @@ struct Shared {
     cfg: Config,
     vault: Mutex<Vault>,
     log: Mutex<File>,
+    /// Held while a prompt is open. One at a time, so prompts never stack up and the
+    /// user is not left guessing which request a prompt belongs to.
+    prompt: Mutex<()>,
+    backoff: Mutex<Backoff>,
+}
+
+/// After a denial, no prompts for a while, doubling with each denial in a row, so an
+/// agent cannot wear the user down by asking again and again.
+#[derive(Default)]
+struct Backoff {
+    until: Option<Instant>,
+    streak: u32,
+}
+
+impl Backoff {
+    fn remaining(&self) -> Option<Duration> {
+        self.until?.checked_duration_since(Instant::now()).filter(|d| !d.is_zero())
+    }
+
+    fn denied(&mut self, base: Duration) {
+        let wait = base.saturating_mul(1 << self.streak.min(5)).min(MAX_BACKOFF);
+        self.streak += 1;
+        self.until = Some(Instant::now() + wait);
+    }
+
+    fn approved(&mut self) {
+        *self = Backoff::default();
+    }
 }
 
 /// A panic in one connection must not take the vault down with it.
@@ -240,11 +284,29 @@ fn missing(w: &mut impl Write, name: &str) -> Reply {
     ("missing", proto::write_err(w, &format!("no secret named {name}")))
 }
 
-/// Asks for approval. None when approved; otherwise the denial or failure already sent.
+/// Asks for approval. None when approved; otherwise the refusal already sent.
 fn gate(sh: &Shared, action: &str, name: &str, caller: &str, peer: &Peer, w: &mut impl Write) -> Option<Reply> {
+    if let Some(wait) = lock(&sh.backoff).remaining() {
+        let msg = format!("a recent request was denied; try again in {}s", wait.as_secs() + 1);
+        return Some(("throttled", proto::write_err(w, &msg)));
+    }
+    let _open = match sh.prompt.try_lock() {
+        Ok(g) => g,
+        Err(TryLockError::Poisoned(p)) => p.into_inner(),
+        Err(TryLockError::WouldBlock) => {
+            let msg = "another approval prompt is open; try again when it closes";
+            return Some(("busy", proto::write_err(w, msg)));
+        }
+    };
     match ask(sh, action, name, caller, peer) {
-        Ok(true) => None,
-        Ok(false) => Some(("denied", proto::write_denied(w))),
+        Ok(true) => {
+            lock(&sh.backoff).approved();
+            None
+        }
+        Ok(false) => {
+            lock(&sh.backoff).denied(sh.cfg.deny_backoff);
+            Some(("denied", proto::write_denied(w)))
+        }
         Err(e) => {
             eprintln!("agent-keychaind: approval: {e}");
             Some(("error", proto::write_err(w, &format!("approval failed: {e}"))))
