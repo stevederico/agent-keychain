@@ -1,5 +1,10 @@
 - Test real polkit install
 - Consider 1-hour approval
+- Add proxy mode (agent never sees secret; plug into cloak/OneCLI or own TLS)
+
+0.10.0
+
+  Plan proxy mode
 
 0.9.0
 

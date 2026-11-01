@@ -94,7 +94,7 @@ The agent keeps the user's files and network; it only loses sight of other proce
 ## Open questions
 
 - Can the polkit prompt show which secret and caller is asking, clearly enough to trust? Omarchy's shell polkit agent shows the action message, which carries both, if polkit accepts the details (see the owner annotation below)
-- Hand secrets to a file descriptor instead of stdout, so they never sit in another process's environment?
+- Proxy mode: hand the agent a placeholder and swap in the real secret on its outgoing HTTPS requests, so the agent never holds it. Needs TLS (breaks the zero-crate rule or means a port) or plugging into an existing proxy (cloak, OneCLI, Infisical Agent Vault)
 - Add "approve for 1 hour", or keep always-prompt?
 - Confirm on a real install: polkit honors the `org.freedesktop.policykit.owner` annotation for the daemon user
 - Packaging: a PKGBUILD for omarchy-pkgs, or local only?
