@@ -1,6 +1,11 @@
 - Test real polkit install
 - Consider 1-hour approval
 
+0.9.0
+
+  Add README
+  Add tool comparison
+
 0.8.0
 
   Add run command
