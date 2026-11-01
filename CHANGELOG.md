@@ -1,8 +1,10 @@
-- Test real polkit install
-- Consider 1-hour approval
 - Add proxy mode (agent never sees secret; plug into cloak/OneCLI or own TLS)
 - Add agent-browser login plugin (credential.read, agent never sees password)
 - Add Mac support (Authorization Services, launchd, Keychain, libproc)
+
+0.17.0
+
+  Clear done to-dos
 
 0.16.0
 
