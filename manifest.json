@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.stevederico.agent-keychain",
+  "name": "Agent Keychain",
+  "version": "0.1.0",
+  "author": "sd",
+  "license": "MIT",
+  "description": "Bar widget for agent-keychain: which agents asked for which secrets, what you approved or denied, your secret names and rules. Needs agent-keychain installed (./install.sh).",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "plugin/BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Agent Keychain",
+    "description": "Recent secret requests, names and rules",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

@@ -36,6 +36,19 @@ cd ~/Projects/agent-keychain && git pull && ./install.sh
 
 Safe to rerun. The vault and its key are never touched.
 
+## Omarchy bar widget
+
+```
+omarchy plugin add https://github.com/stevederico/agent-keychain --enable
+```
+
+- Key icon in the bar, dimmed when the daemon is not running
+- Click: recent requests (which agent, which secret, approved or denied), secret names, rules
+- Right click: full log in a terminal
+- `omarchy-shell agent-keychain toggle` opens it from a keybinding
+- Reads only, never asks for a secret. Fetches when opened, at most once a minute, since each read is logged
+- Needs agent-keychain installed first (`./install.sh`)
+
 ## Use
 
 ```
