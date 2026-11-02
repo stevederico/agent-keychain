@@ -2,6 +2,10 @@
 - Add agent-browser login plugin (credential.read, agent never sees password)
 - Add Mac support (Authorization Services, launchd, Keychain, libproc, LOCAL_PEERCRED/audit token, getentropy, PT_DENY_ATTACH, macOS struct layouts in sys.rs)
 
+0.30.0
+
+  Document widget removal
+
 0.29.0
 
   Add Omarchy widget

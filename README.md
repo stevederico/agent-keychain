@@ -48,6 +48,7 @@ omarchy plugin add https://github.com/stevederico/agent-keychain --enable
 - `omarchy-shell agent-keychain toggle` opens it from a keybinding
 - Reads only, never asks for a secret. Fetches when opened, at most once a minute, since each read is logged
 - Needs agent-keychain installed first (`./install.sh`)
+- Remove: `omarchy plugin remove io.github.stevederico.agent-keychain` (the keychain itself: `./uninstall.sh`)
 
 ## Use
 
