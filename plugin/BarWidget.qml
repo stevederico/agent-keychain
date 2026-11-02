@@ -63,9 +63,17 @@ BarWidget {
     Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation", "agent-keychain"].concat(args))
   }
 
+  // PopupCard and the bar close the popup through these. Without close() it
+  // writes popup.open itself, which breaks the binding to popupOpen.
+  function open() { root.popupOpen = true }
+  function close() { root.popupOpen = false }
+  function toggle() { root.popupOpen = !root.popupOpen }
+
   ShellIpc {
     target: "agent-keychain"
-    function toggle(): void { root.popupOpen = !root.popupOpen }
+    function open(): void { root.open() }
+    function close(): void { root.close() }
+    function toggle(): void { root.toggle() }
   }
 
   onPopupOpenChanged: if (popupOpen) { checkSocket(); refresh(false) }
@@ -141,7 +149,7 @@ BarWidget {
     onPressed: function(b) {
       if (!root.bar) return
       if (b === Qt.RightButton) root.openTerminal(["log"])
-      else root.popupOpen = !root.popupOpen
+      else root.toggle()
     }
   }
 
