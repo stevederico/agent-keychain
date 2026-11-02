@@ -1,6 +1,6 @@
 [package]
 name = "agent-keychain"
-version = "0.30.0"
+version = "0.31.0"
 license = "MIT"
 edition = "2024"
 description = "Local keychain that gives AI agents a secret only after you approve"

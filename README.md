@@ -38,6 +38,8 @@ Safe to rerun. The vault and its key are never touched.
 
 ## Omarchy bar widget
 
+![Agent Keychain bar widget](preview.png)
+
 ```
 omarchy plugin add https://github.com/stevederico/agent-keychain --enable
 ```
