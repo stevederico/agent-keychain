@@ -36,6 +36,8 @@ commands:
   list                list secret names
   log                 show recent requests
   with <names> <cmd>  run a program that may get these secrets without asking, for a while
+  grants              list programs started with `with` that still skip prompts
+  revoke <pid|all>    end a `with` grant now, or all of them
   allow <agent> <name>
                       let an agent get a secret without asking (asks you to approve)
   deny <agent> <name|'*'>
@@ -51,8 +53,8 @@ commands:
   help <command>      details for one command
   --version           print the version
 
---json: JSON output for list, log, rules, scan, doctor, set, rm, import, allow,
-deny, unallow and --version,
+--json: JSON output for list, log, rules, grants, revoke, scan, doctor, set, rm,
+import, allow, deny, unallow and --version,
 and errors as {\"error\": ..., \"code\": ...}. get always prints the raw value.
 
 example:
@@ -93,7 +95,21 @@ Asks you once, then runs the program. It and everything it starts may get these 
 without a prompt until the time is up (default 1h, at most 12h: 90s, 30m, 2h) or it exits.
 Other secrets and other programs still ask.
 
-  agent-keychain with github,npm --for 2h -- claude"),
+  agent-keychain with github,npm --for 2h -- claude
+
+`agent-keychain grants` lists live grants; `agent-keychain revoke <pid>` ends one early."),
+    ("grants", "usage: agent-keychain grants [--json]
+
+Lists live `with` grants, one per line: program, pid, secrets, time left. Never
+prompts. --json gives an array of {\"pid\", \"program\", \"secrets\", \"seconds\"}."),
+    ("revoke", "usage: agent-keychain revoke <pid|all> [--json]
+
+Ends the `with` grant held by that pid (from `agent-keychain grants`), or every grant.
+The program keeps running, but its next get asks again. Never prompts: it only takes
+access away. To remove a standing rule, use unallow.
+
+  agent-keychain revoke 4242
+  agent-keychain revoke all"),
     ("allow", "usage: agent-keychain allow <agent> <name> [--json]
 
 Lets the agent get this secret with no prompt, from now on. Asks you to approve the
@@ -231,6 +247,12 @@ fn run() -> Result<ExitCode, String> {
         ["get", n] => Request::Get(name(n)?),
         ["rm", n] => Request::Rm(name(n)?),
         ["rules"] => Request::Rules,
+        ["grants"] => Request::Grants,
+        ["revoke", "all"] => Request::Revoke(None),
+        ["revoke", pid] => match pid.parse::<i32>() {
+            Ok(n) if n > 1 && n.to_string() == *pid => Request::Revoke(Some(n)),
+            _ => return Err(format!("bad pid {pid:?}: use a pid from `agent-keychain grants`, or all")),
+        },
         ["allow", a, s] => Request::Rule(Rule::new(Effect::Allow, a, s)?),
         ["deny", a, s] => Request::Rule(Rule::new(Effect::Deny, a, s)?),
         ["unallow", a, s] => {
@@ -432,6 +454,8 @@ fn print_ok(req: &Request, data: &[u8]) -> io::Result<()> {
             Request::Unrule(a, s) => {
                 writeln!(out, "{{\"removed\":{{\"agent\":{},\"secret\":{}}}}}", json_string(a), json_string(s))?
             }
+            Request::Grants => writeln!(out, "[{}]", text.lines().filter_map(grant_json).collect::<Vec<_>>().join(","))?,
+            Request::Revoke(_) => writeln!(out, "{{\"revoked\":{}}}", text.trim())?,
             Request::Get(_) | Request::Allow(..) => {}
         }
         return out.flush();
@@ -458,6 +482,17 @@ fn print_ok(req: &Request, data: &[u8]) -> io::Result<()> {
         Request::Rm(n) => eprintln!("removed {n}"),
         Request::Rule(r) => eprintln!("rule: {} {} {}", r.effect.as_str(), r.agent, r.secret),
         Request::Unrule(a, s) => eprintln!("removed the rule for {a} {s}"),
+        Request::Grants => {
+            for line in String::from_utf8_lossy(data).lines() {
+                if let Some((pid, secs, names, program)) = grant_fields(line) {
+                    writeln!(out, "{program}  pid {pid}  {names}  {} left", left(secs))?;
+                }
+            }
+        }
+        Request::Revoke(_) => {
+            let n = String::from_utf8_lossy(data).trim().to_string();
+            eprintln!("revoked {n} grant{}", if n == "1" { "" } else { "s" });
+        }
         Request::Allow(..) => {}
     }
     out.flush()
@@ -604,6 +639,30 @@ fn store_request(mut items: Vec<(String, scan::Finding)>, rename: bool) -> Resul
     }
     let list = items.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(",");
     Ok(Request::SetMany(list, items))
+}
+
+/// One GRANTS line: (pid, seconds left, names, program). The program may hold spaces.
+fn grant_fields(line: &str) -> Option<(&str, u64, &str, &str)> {
+    let mut parts = line.splitn(4, ' ');
+    let pid = parts.next()?;
+    let secs = parts.next()?.parse().ok()?;
+    Some((pid, secs, parts.next()?, parts.next()?))
+}
+
+fn grant_json(line: &str) -> Option<String> {
+    let (pid, secs, names, program) = grant_fields(line)?;
+    let secrets = names.split(',').map(json_string).collect::<Vec<_>>().join(",");
+    Some(format!("{{\"pid\":{pid},\"program\":{},\"secrets\":[{secrets}],\"seconds\":{secs}}}", json_string(program)))
+}
+
+/// 42s, 5m, 1h 20m.
+fn left(secs: u64) -> String {
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s % 3600 / 60 == 0 => format!("{}h", s / 3600),
+        s => format!("{}h {}m", s / 3600, s % 3600 / 60),
+    }
 }
 
 fn rule_json(r: &Rule) -> String {

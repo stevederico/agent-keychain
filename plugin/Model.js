@@ -1,6 +1,6 @@
-// Reads the widget makes itself (LIST, LOG, RULES) and other reads are noise
+// Reads the widget makes itself (LIST, LOG, RULES, GRANTS) and other reads are noise
 // in the popup; the full log is one click away.
-const quiet = { LIST: true, LOG: true, VERSION: true, RULES: true }
+const quiet = { LIST: true, LOG: true, VERSION: true, RULES: true, GRANTS: true }
 const shells = { "agent-keychain": true, bash: true, zsh: true, sh: true, dash: true, fish: true, nu: true, env: true }
 const terminals = { ghostty: true, alacritty: true, kitty: true, foot: true, wezterm: true, "wezterm-gui": true, konsole: true }
 
@@ -58,4 +58,13 @@ function ago(iso, nowMs) {
 
 function ruleLabel(rule) {
   return rule.effect + " " + rule.agent + " " + rule.secret
+}
+
+// 42s, 5m, 1h 20m
+function left(secs) {
+  var s = Math.max(0, Math.round(Number(secs) || 0))
+  if (s < 60) return s + "s"
+  if (s < 3600) return Math.floor(s / 60) + "m"
+  var m = Math.floor(s % 3600 / 60)
+  return Math.floor(s / 3600) + "h" + (m ? " " + m + "m" : "")
 }

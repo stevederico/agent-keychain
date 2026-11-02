@@ -360,6 +360,18 @@ fn respond(sh: &Shared, req: &Request, peer: &Peer, caller: &str, sock: RawFd, w
             lock(&sh.grants).insert(chain[0], Grant { names, until });
             ("approved", proto::write_ok(w, b""))
         }
+        Request::Grants => ("listed", proto::write_ok(w, grants_text(sh).as_bytes())),
+        Request::Revoke(pid) => {
+            let mut grants = lock(&sh.grants);
+            let before = grants.len();
+            grants.retain(|&(p, _), _| pid.is_some_and(|want| p != want));
+            let revoked = before - grants.len();
+            drop(grants);
+            match (pid, revoked) {
+                (Some(pid), 0) => ("missing", proto::write_err(w, &format!("no grant held by pid {pid}"))),
+                _ => ("revoked", proto::write_ok(w, revoked.to_string().as_bytes())),
+            }
+        }
         Request::Rules => {
             let text = rules::format(lock(&sh.rules).list());
             ("listed", proto::write_ok(w, text.trim_end().as_bytes()))
@@ -446,6 +458,25 @@ fn agent_chain(sock: RawFd, pid: i32) -> Option<Vec<String>> {
     }
     let skip = usize::from(names[0] == rules::CLIENT_NAME);
     Some(names.into_iter().skip(skip).collect())
+}
+
+/// Live grants, one per line: `<pid> <seconds left> <names> <program>`. The program is
+/// last because its name may hold spaces. Grants that expired, or whose process is gone
+/// or was replaced under the same pid, are dropped first.
+fn grants_text(sh: &Shared) -> String {
+    let mut grants = lock(&sh.grants);
+    let now = Instant::now();
+    grants.retain(|&(pid, start), g| g.until > now && peer::proc_stat(pid).is_ok_and(|(_, s)| s == start));
+    let mut rows: Vec<_> = grants.iter().collect();
+    rows.sort_by_key(|&(&(pid, _), _)| pid);
+    rows.iter()
+        .map(|&(&(pid, _), g)| {
+            let left = (g.until - now).as_secs() + 1;
+            let program = peer::comm(pid).unwrap_or_else(|_| "?".into());
+            format!("{pid} {left} {} {program}", g.names.join(","))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Whether the asking process, or one of its ancestors, holds a live grant for `name`.

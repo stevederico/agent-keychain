@@ -268,6 +268,52 @@ fn with_skips_prompts_for_its_programs() {
 }
 
 #[test]
+fn revoke_ends_a_grant_early() {
+    let mut env = Env::new("revoke");
+    env.start(current_uid());
+    assert_eq!(env.client(&["set", "github"], b"tok").0, 0);
+    assert_eq!(env.client(&["grants", "--json"], b""), (0, "[]\n".into(), String::new()));
+
+    // The granted program waits for "go", then asks for github.
+    let script = format!("while [ ! -e go ]; do sleep 0.05; done; {CLIENT} get github");
+    let child = env.spawn_client(&["with", "github", "--for", "1h", "--", "sh", "-c", &script], b"");
+    let pid = child.id().to_string();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let listed = loop {
+        let (_, out, _) = env.client(&["grants", "--json"], b"");
+        if out.contains(&pid) || Instant::now() > deadline {
+            break out;
+        }
+        sleep(Duration::from_millis(20));
+    };
+    assert!(listed.starts_with(&format!("[{{\"pid\":{pid},\"program\":\"sh\",\"secrets\":[\"github\"],\"seconds\":")), "{listed}");
+    let (code, out, _) = env.client(&["grants"], b"");
+    assert_eq!(code, 0);
+    assert!(out.starts_with(&format!("sh  pid {pid}  github  ")), "{out}");
+
+    let before = prompts(&env);
+    assert_eq!(env.client(&["revoke", &pid, "--json"], b""), (0, "{\"revoked\":1}\n".into(), String::new()));
+    assert_eq!(prompts(&env), before, "revoking never prompts");
+    assert_eq!(env.client(&["grants", "--json"], b"").1, "[]\n");
+
+    // The program still runs, but its get now asks.
+    fs::write(env.path("go"), "").unwrap();
+    let (code, out, _) = summarize(child.wait_with_output().unwrap());
+    assert_eq!((code, out.as_str()), (0, "tok"));
+    assert_eq!(prompts(&env), before + 1);
+
+    assert_eq!(env.client(&["revoke", &pid], b"").0, 1, "nothing left to revoke");
+    assert_eq!(env.client(&["revoke", "all", "--json"], b"").1, "{\"revoked\":0}\n");
+    for bad in ["0", "1", "-3", "+5", "x"] {
+        assert_eq!(env.client(&["revoke", bad], b"").0, 1, "{bad}");
+    }
+    let log = read(&env.path("state/log"));
+    for want in [format!("REVOKE pid:{pid}"), "revoked".into(), "REVOKE all".into(), "GRANTS - ".into()] {
+        assert!(log.contains(&want), "log lacks {want:?}:\n{log}");
+    }
+}
+
+#[test]
 fn with_bad_input() {
     let mut env = Env::new("withbad");
     env.start(current_uid());

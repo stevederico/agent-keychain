@@ -2,6 +2,12 @@
 - Add agent-browser login plugin (credential.read, agent never sees password)
 - Add Mac support (Authorization Services, launchd, Keychain, libproc, LOCAL_PEERCRED/audit token, getentropy, PT_DENY_ATTACH, macOS struct layouts in sys.rs)
 
+0.32.0
+
+  Add grants command
+  Add revoke command
+  Revoke from widget
+
 0.31.0
 
   Add widget preview

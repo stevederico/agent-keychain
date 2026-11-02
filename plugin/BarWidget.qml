@@ -20,6 +20,7 @@ BarWidget {
   property bool installed: true
   property var secrets: []
   property var rules: []
+  property var grants: []
   property var entries: []
   property double fetchedAt: 0
   property double now: Date.now()
@@ -28,6 +29,7 @@ BarWidget {
   readonly property string summary: !installed ? "Not installed"
     : !running ? "Daemon not running"
     : secrets.length + (secrets.length === 1 ? " secret" : " secrets") + " · " + rules.length + (rules.length === 1 ? " rule" : " rules")
+      + (grants.length ? " · " + grants.length + (grants.length === 1 ? " grant" : " grants") : "")
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -44,6 +46,17 @@ BarWidget {
     if (!listProc.running) listProc.running = true
     if (!rulesProc.running) rulesProc.running = true
     if (!logProc.running) logProc.running = true
+    if (!grantsProc.running) grantsProc.running = true
+  }
+
+  // Revoking a grant never prompts; removing a rule asks for your password.
+  function revokeGrant(pid) { runAction(["revoke", String(pid)]) }
+  function removeRule(rule) { runAction(["unallow", rule.agent, rule.secret]) }
+
+  function runAction(args) {
+    if (actionProc.running) return
+    actionProc.command = ["agent-keychain"].concat(args)
+    actionProc.running = true
   }
 
   function openTerminal(args) {
@@ -93,6 +106,20 @@ BarWidget {
       waitForEnd: true
       onStreamFinished: root.entries = Model.parseJson(text, [])
     }
+  }
+
+  Process {
+    id: grantsProc
+    command: ["agent-keychain", "grants", "--json"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.grants = Model.parseJson(text, [])
+    }
+  }
+
+  Process {
+    id: actionProc
+    onExited: root.refresh(true)
   }
 
   Timer {
@@ -242,6 +269,61 @@ BarWidget {
       }
 
       PanelSectionHeader {
+        visible: root.running && root.grants.length > 0
+        text: "GRANTS"
+        foreground: root.bar.foreground
+        fontFamily: root.bar.fontFamily
+      }
+
+      Repeater {
+        model: root.running ? root.grants : []
+
+        Item {
+          required property var modelData
+          width: column.width
+          height: Math.max(grantText.implicitHeight, grantRevoke.height)
+
+          Text {
+            id: grantText
+            anchors.left: parent.left
+            anchors.right: grantLeft.left
+            anchors.rightMargin: Style.space(8)
+            anchors.verticalCenter: parent.verticalCenter
+            textFormat: Text.PlainText
+            text: modelData.program + "  " + modelData.secrets.join(",")
+            elide: Text.ElideRight
+            color: root.bar.foreground
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+
+          Text {
+            id: grantLeft
+            anchors.right: grantRevoke.left
+            anchors.rightMargin: Style.space(6)
+            anchors.verticalCenter: parent.verticalCenter
+            text: Model.left(modelData.seconds) + " left"
+            color: Qt.darker(root.bar.foreground, 1.4)
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          PanelActionButton {
+            id: grantRevoke
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            iconText: "󰅖"
+            tooltipText: "Revoke · pid " + modelData.pid
+            foreground: root.bar.foreground
+            hoverColor: Color.urgent
+            fontFamily: root.bar.fontFamily
+            fontSize: Style.font.bodySmall
+            onClicked: root.revokeGrant(modelData.pid)
+          }
+        }
+      }
+
+      PanelSectionHeader {
         visible: root.running && root.rules.length > 0
         text: "RULES"
         foreground: root.bar.foreground
@@ -251,13 +333,37 @@ BarWidget {
       Repeater {
         model: root.running ? root.rules : []
 
-        Text {
+        Item {
           required property var modelData
-          textFormat: Text.PlainText
-          text: Model.ruleLabel(modelData)
-          color: modelData.effect === "deny" ? Color.urgent : root.bar.foreground
-          font.family: root.bar.fontFamily
-          font.pixelSize: Style.font.bodySmall
+          width: column.width
+          height: Math.max(ruleText.implicitHeight, ruleRemove.height)
+
+          Text {
+            id: ruleText
+            anchors.left: parent.left
+            anchors.right: ruleRemove.left
+            anchors.rightMargin: Style.space(8)
+            anchors.verticalCenter: parent.verticalCenter
+            textFormat: Text.PlainText
+            text: Model.ruleLabel(modelData)
+            elide: Text.ElideRight
+            color: modelData.effect === "deny" ? Color.urgent : root.bar.foreground
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+
+          PanelActionButton {
+            id: ruleRemove
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            iconText: "󰅖"
+            tooltipText: modelData.effect === "allow" ? "Revoke (asks for your password)" : "Remove (asks for your password)"
+            foreground: root.bar.foreground
+            hoverColor: Color.urgent
+            fontFamily: root.bar.fontFamily
+            fontSize: Style.font.bodySmall
+            onClicked: root.removeRule(modelData)
+          }
         }
       }
 

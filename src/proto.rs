@@ -4,6 +4,7 @@
 //!           | `ALLOW <name>[,<name>...] <seconds>\n`
 //!           | `SETMANY <count>\n` then `<count>` times `<name>\n<len>\n<bytes>`
 //!           | `RULES\n` | `RULE allow|deny <agent> <secret>\n` | `UNRULE <agent> <secret>\n`
+//!           | `GRANTS\n` | `REVOKE <pid>|all\n`
 //! Response: `OK <len>\n<bytes>` | `DENIED\n` | `ERR <message>\n`
 
 use crate::crypto::SecretBytes;
@@ -40,6 +41,11 @@ pub enum Request {
     Rule(Rule),
     /// Remove the rule for an agent and secret: (agent, secret).
     Unrule(String, String),
+    /// The live ALLOW grants. Never prompts.
+    Grants,
+    /// End the ALLOW grant held by this pid, or every grant (None). Never prompts:
+    /// it only takes access away.
+    Revoke(Option<i32>),
 }
 
 impl Request {
@@ -56,6 +62,8 @@ impl Request {
             Request::Rule(r) if r.effect == Effect::Allow => "RULE-ALLOW",
             Request::Rule(_) => "RULE-DENY",
             Request::Unrule(..) => "RULE-RM",
+            Request::Grants => "GRANTS",
+            Request::Revoke(_) => "REVOKE",
         }
     }
 
@@ -69,7 +77,9 @@ impl Request {
             | Request::SetMany(n, _) => n.clone(),
             Request::Rule(r) => format!("{}:{}", r.agent, r.secret),
             Request::Unrule(a, s) => format!("{a}:{s}"),
-            Request::List | Request::Log | Request::Version | Request::Rules => "-".into(),
+            Request::Revoke(Some(pid)) => format!("pid:{pid}"),
+            Request::Revoke(None) => "all".into(),
+            Request::List | Request::Log | Request::Version | Request::Rules | Request::Grants => "-".into(),
         }
     }
 }
@@ -128,6 +138,13 @@ pub fn read_request(r: &mut impl BufRead) -> io::Result<Request> {
         ("LOG", None) => Ok(Request::Log),
         ("VERSION", None) => Ok(Request::Version),
         ("RULES", None) => Ok(Request::Rules),
+        ("GRANTS", None) => Ok(Request::Grants),
+        ("REVOKE", Some("all")) => Ok(Request::Revoke(None)),
+        // Canonical digits only, so "+5" or "05" never reads as pid 5.
+        ("REVOKE", Some(text)) => match text.parse::<i32>() {
+            Ok(pid) if pid > 1 && pid.to_string() == text => Ok(Request::Revoke(Some(pid))),
+            _ => Err(invalid("use REVOKE <pid>|all")),
+        },
         ("RULE", Some(rest)) => {
             let [effect, agent, secret] = rest.split(' ').collect::<Vec<_>>()[..] else {
                 return Err(invalid("use RULE allow|deny <agent> <secret>"));
@@ -191,6 +208,9 @@ pub fn write_request(w: &mut impl Write, req: &Request) -> io::Result<()> {
         Request::Log => w.write_all(b"LOG\n")?,
         Request::Version => w.write_all(b"VERSION\n")?,
         Request::Rules => w.write_all(b"RULES\n")?,
+        Request::Grants => w.write_all(b"GRANTS\n")?,
+        Request::Revoke(Some(pid)) => writeln!(w, "REVOKE {pid}")?,
+        Request::Revoke(None) => w.write_all(b"REVOKE all\n")?,
         Request::Rule(r) => writeln!(w, "RULE {} {} {}", r.effect.as_str(), r.agent, r.secret)?,
         Request::Unrule(a, s) => writeln!(w, "UNRULE {a} {s}")?,
         Request::Get(n) => writeln!(w, "GET {n}")?,
@@ -280,6 +300,9 @@ mod tests {
         assert!(matches!(roundtrip(Request::Rule(rule.clone())), Request::Rule(r) if r == rule));
         assert!(matches!(roundtrip(Request::Unrule("claude".into(), "github".into())),
             Request::Unrule(a, s) if a == "claude" && s == "github"));
+        assert!(matches!(roundtrip(Request::Grants), Request::Grants));
+        assert!(matches!(roundtrip(Request::Revoke(Some(4242))), Request::Revoke(Some(4242))));
+        assert!(matches!(roundtrip(Request::Revoke(None)), Request::Revoke(None)));
     }
 
     #[test]
@@ -292,7 +315,9 @@ mod tests {
             "SETMANY 0\n", "SETMANY 33\n", "SETMANY 2\na\n1\nxa\n1\ny", "SETMANY 1\nBad\n1\nx",
             "RULES x\n", "RULE allow claude\n", "RULE allow claude *\n", "RULE permit claude github\n",
             "RULE allow agent-keychain github\n", "RULE allow claude  github\n", "RULE deny a/b github\n",
-            "UNRULE claude\n", "UNRULE claude Bad\n", "UNRULE claude github x\n"] {
+            "UNRULE claude\n", "UNRULE claude Bad\n", "UNRULE claude github x\n",
+            "GRANTS x\n", "REVOKE\n", "REVOKE 1\n", "REVOKE 0\n", "REVOKE -5\n", "REVOKE +5\n", "REVOKE 05\n",
+            "REVOKE All\n", "REVOKE 5 6\n"] {
             assert!(read_request(&mut raw.as_bytes()).is_err(), "{raw:?}");
         }
         let long = format!("GET {}\n", "a".repeat(400));

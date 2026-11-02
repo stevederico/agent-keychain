@@ -45,10 +45,11 @@ omarchy plugin add https://github.com/stevederico/agent-keychain --enable
 ```
 
 - Key icon in the bar, dimmed when the daemon is not running
-- Click: recent requests (which agent, which secret, approved or denied), secret names, rules
+- Click: recent requests (which agent, which secret, approved or denied), secret names, `with` grants, rules
+- Revoke from the popup: ✕ on a grant ends it at once; ✕ on a rule removes it after your password
 - Right click: full log in a terminal
 - `omarchy-shell agent-keychain toggle` opens it from a keybinding
-- Reads only, never asks for a secret. Fetches when opened, at most once a minute, since each read is logged
+- Never asks for a secret. Fetches when opened, at most once a minute, since each read is logged
 - Needs agent-keychain installed first (`./install.sh`)
 - Remove: `omarchy plugin remove io.github.stevederico.agent-keychain` (the keychain itself: `./uninstall.sh`)
 
@@ -67,6 +68,8 @@ agent-keychain scan              # optional: find keys in plain files (.env, ~/.
 agent-keychain import ~/.npmrc:5 ~/proj/.env:2=github   # optional: store what scan found, one approval
 agent-keychain import --all      # optional: store everything scan finds
 agent-keychain with github,npm --for 2h -- claude   # ask once, then no prompts for these
+agent-keychain grants            # programs started with `with` that still skip prompts
+agent-keychain revoke 4242       # end that grant now (or `revoke all`), no prompt
 agent-keychain allow claude github   # claude gets github with no prompt, needs approval
 agent-keychain deny codex '*'        # codex is refused everything with no prompt, needs approval
 agent-keychain unallow claude github # remove that rule, needs approval

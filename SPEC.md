@@ -105,6 +105,7 @@ Agent use: `GITHUB_TOKEN=$(agent-keychain get github) gh pr list`
   - The ancestry is read twice and compared, and the asker is confirmed alive through its pidfd (`SO_PEERPIDFD`), so a pid freed and reused mid-request cannot borrow a grant
   - Only `get`. `set` and `rm` always prompt. Other secrets and other programs still prompt
   - Grants live in the daemon's memory only; a restart drops them
+  - `grants` lists live grants (pid, program, secrets, time left) and never prompts. `revoke <pid>` or `revoke all` ends grants early, with no prompt, since it only takes access away. Any process running as the owner can revoke, so the worst an agent can do with it is make other programs prompt again
 - **Agent rules**: `allow <agent> <secret>`, `deny <agent> <secret|*>`
   - Order for a `get`: a matching deny rule refuses (`denied-by-rule`, exit 2), then a matching allow rule returns the secret (`allowed-by-rule`), then a `with` grant, then the prompt
   - A rule deny prompts nobody, so it does not start or extend the backoff. An allow rule is not held back by the backoff, like a grant

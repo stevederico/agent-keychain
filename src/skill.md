@@ -42,7 +42,7 @@ If a task needs the same secret many times, ask the user to start you with:
 agent-keychain with github --for 2h -- <your command>
 ```
 
-They approve once; you and your child processes then get `github` without prompts until it expires. You cannot set this up yourself without the user approving it.
+They approve once; you and your child processes then get `github` without prompts until it expires. You cannot set this up yourself without the user approving it. The user can end it early with `agent-keychain revoke`; after that your next `get` prompts again.
 
 ## Rules the user set
 
