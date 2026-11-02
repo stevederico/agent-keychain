@@ -27,6 +27,17 @@
     <annotate key="org.freedesktop.policykit.owner">unix-user:agent-keychain</annotate>
   </action>
 
+  <action id="dev.agent-keychain.rule">
+    <description>Change which agents get secrets without asking</description>
+    <message>"$(caller)" wants to $(change)</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_self</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.owner">unix-user:agent-keychain</annotate>
+  </action>
+
   <action id="dev.agent-keychain.write">
     <description>Change a stored secret</description>
     <message>"$(caller)" wants to change the secret "$(secret)"</message>

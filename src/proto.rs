@@ -3,10 +3,12 @@
 //! Request:  `LIST\n` | `LOG\n` | `VERSION\n` | `GET <name>\n` | `RM <name>\n` | `SET <name>\n<len>\n<bytes>`
 //!           | `ALLOW <name>[,<name>...] <seconds>\n`
 //!           | `SETMANY <count>\n` then `<count>` times `<name>\n<len>\n<bytes>`
+//!           | `RULES\n` | `RULE allow|deny <agent> <secret>\n` | `UNRULE <agent> <secret>\n`
 //! Response: `OK <len>\n<bytes>` | `DENIED\n` | `ERR <message>\n`
 
 use crate::crypto::SecretBytes;
 use crate::names::valid_name;
+use crate::rules::{self, Effect, Rule};
 use std::io::{self, BufRead, Read, Write};
 
 pub const MAX_SECRET: usize = 16 * 1024;
@@ -32,6 +34,12 @@ pub enum Request {
     Allow(String, u64),
     /// Store several secrets under one approval. The String is the names, comma-separated.
     SetMany(String, Vec<(String, SecretBytes)>),
+    /// The per-agent rules. Never prompts.
+    Rules,
+    /// Add or replace the rule for one agent and secret.
+    Rule(Rule),
+    /// Remove the rule for an agent and secret: (agent, secret).
+    Unrule(String, String),
 }
 
 impl Request {
@@ -44,17 +52,24 @@ impl Request {
             Request::Rm(_) => "RM",
             Request::Set(..) | Request::SetMany(..) => "SET",
             Request::Allow(..) => "ALLOW",
+            Request::Rules => "RULES",
+            Request::Rule(r) if r.effect == Effect::Allow => "RULE-ALLOW",
+            Request::Rule(_) => "RULE-DENY",
+            Request::Unrule(..) => "RULE-RM",
         }
     }
 
-    pub fn name(&self) -> Option<&str> {
+    /// The name column of the log: the secret names, `agent:secret` for a rule, else `-`.
+    pub fn log_name(&self) -> String {
         match self {
             Request::Get(n)
             | Request::Rm(n)
             | Request::Set(n, _)
             | Request::Allow(n, _)
-            | Request::SetMany(n, _) => Some(n),
-            Request::List | Request::Log | Request::Version => None,
+            | Request::SetMany(n, _) => n.clone(),
+            Request::Rule(r) => format!("{}:{}", r.agent, r.secret),
+            Request::Unrule(a, s) => format!("{a}:{s}"),
+            Request::List | Request::Log | Request::Version | Request::Rules => "-".into(),
         }
     }
 }
@@ -112,6 +127,21 @@ pub fn read_request(r: &mut impl BufRead) -> io::Result<Request> {
         ("LIST", None) => Ok(Request::List),
         ("LOG", None) => Ok(Request::Log),
         ("VERSION", None) => Ok(Request::Version),
+        ("RULES", None) => Ok(Request::Rules),
+        ("RULE", Some(rest)) => {
+            let [effect, agent, secret] = rest.split(' ').collect::<Vec<_>>()[..] else {
+                return Err(invalid("use RULE allow|deny <agent> <secret>"));
+            };
+            let effect = Effect::parse(effect).ok_or_else(|| invalid("use RULE allow|deny <agent> <secret>"))?;
+            Ok(Request::Rule(Rule::new(effect, agent, secret).map_err(|m| invalid(&m))?))
+        }
+        ("UNRULE", Some(rest)) => {
+            let (agent, secret) = rest.split_once(' ').ok_or_else(|| invalid("use UNRULE <agent> <secret>"))?;
+            if !rules::valid_agent(agent) || !rules::valid_secret(secret) {
+                return Err(invalid("bad agent or secret name"));
+            }
+            Ok(Request::Unrule(agent.into(), secret.into()))
+        }
         ("GET", n) => Ok(Request::Get(named(n)?)),
         ("RM", n) => Ok(Request::Rm(named(n)?)),
         ("ALLOW", Some(rest)) => {
@@ -160,6 +190,9 @@ pub fn write_request(w: &mut impl Write, req: &Request) -> io::Result<()> {
         Request::List => w.write_all(b"LIST\n")?,
         Request::Log => w.write_all(b"LOG\n")?,
         Request::Version => w.write_all(b"VERSION\n")?,
+        Request::Rules => w.write_all(b"RULES\n")?,
+        Request::Rule(r) => writeln!(w, "RULE {} {} {}", r.effect.as_str(), r.agent, r.secret)?,
+        Request::Unrule(a, s) => writeln!(w, "UNRULE {a} {s}")?,
         Request::Get(n) => writeln!(w, "GET {n}")?,
         Request::Rm(n) => writeln!(w, "RM {n}")?,
         Request::Allow(list, secs) => writeln!(w, "ALLOW {list} {secs}")?,
@@ -242,6 +275,11 @@ mod tests {
         }
         assert!(matches!(roundtrip(Request::Allow("github,aws.prod".into(), 3600)),
             Request::Allow(l, 3600) if l == "github,aws.prod"));
+        assert!(matches!(roundtrip(Request::Rules), Request::Rules));
+        let rule = Rule::new(Effect::Deny, "codex", "*").unwrap();
+        assert!(matches!(roundtrip(Request::Rule(rule.clone())), Request::Rule(r) if r == rule));
+        assert!(matches!(roundtrip(Request::Unrule("claude".into(), "github".into())),
+            Request::Unrule(a, s) if a == "claude" && s == "github"));
     }
 
     #[test]
@@ -251,7 +289,10 @@ mod tests {
         }
         for raw in ["ALLOW github\n", "ALLOW github 0\n", "ALLOW github 43201\n", "ALLOW github,github 60\n",
             "ALLOW github, 60\n", "ALLOW ,github 60\n", "ALLOW Git 60\n", "ALLOW github -5\n",
-            "SETMANY 0\n", "SETMANY 33\n", "SETMANY 2\na\n1\nxa\n1\ny", "SETMANY 1\nBad\n1\nx"] {
+            "SETMANY 0\n", "SETMANY 33\n", "SETMANY 2\na\n1\nxa\n1\ny", "SETMANY 1\nBad\n1\nx",
+            "RULES x\n", "RULE allow claude\n", "RULE allow claude *\n", "RULE permit claude github\n",
+            "RULE allow agent-keychain github\n", "RULE allow claude  github\n", "RULE deny a/b github\n",
+            "UNRULE claude\n", "UNRULE claude Bad\n", "UNRULE claude github x\n"] {
             assert!(read_request(&mut raw.as_bytes()).is_err(), "{raw:?}");
         }
         let long = format!("GET {}\n", "a".repeat(400));

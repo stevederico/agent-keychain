@@ -28,10 +28,11 @@ impl Env {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("key"), [7u8; 32]).unwrap();
-        // Approves unless a file named "deny" exists; records each call. A file named
+        // Approves unless a file named "deny" exists; records each call (action, name,
+        // caller, then key=value details). A file named
         // "slow" holds the prompt open until it is removed.
         let script = format!(
-            "#!/bin/sh\necho \"$1 $2 $3\" >> '{0}/approvals'\nwhile [ -e '{0}/slow' ]; do sleep 0.05; done\n[ -e '{0}/deny' ] && exit 1\nexit 0\n",
+            "#!/bin/sh\necho \"$*\" >> '{0}/approvals'\nwhile [ -e '{0}/slow' ]; do sleep 0.05; done\n[ -e '{0}/deny' ] && exit 1\nexit 0\n",
             dir.display()
         );
         let approver = dir.join("approve.sh");
@@ -279,6 +280,168 @@ fn with_bad_input() {
         assert_eq!(env.client(bad, b"").0, 1, "{bad:?}");
     }
     assert!(!env.path("approvals").exists() || !read(&env.path("approvals")).contains("allow"), "never prompted");
+}
+
+/// Runs `agent-keychain <args>` under a chain of shells renamed to these agent names,
+/// outermost first, so the daemon sees `agent-keychain <- chain[last] <- ... <- chain[0]`.
+/// Each level runs the next inside $( ), so no shell execs away its own process.
+fn run_as(env: &Env, chain: &[&str], args: &str) -> (i32, String, String) {
+    let wrap = |cmd: String| format!("out=$({cmd}); c=$?; printf %s \"$out\"; exit $c");
+    let script = |i: usize| match chain.get(i + 1) {
+        None => wrap(format!("{CLIENT} {args}")),
+        Some(next) => wrap(format!("{} -c \"$S{}\"", env.path(next).display(), i + 1)),
+    };
+    for agent in chain {
+        // A symlink: the kernel names a process after the path it was started by, and
+        // unlike a copy it cannot hit ETXTBSY while another test thread forks.
+        if fs::symlink_metadata(env.path(agent)).is_err() {
+            std::os::unix::fs::symlink("/bin/sh", env.path(agent)).unwrap();
+        }
+    }
+    let mut cmd = Command::new(env.path(chain[0]));
+    cmd.current_dir(&env.dir).env("AGENT_KEYCHAIN_SOCKET", "sock").args(["-c", &script(0)]);
+    for i in 1..chain.len() {
+        cmd.env(format!("S{i}"), script(i));
+    }
+    summarize(cmd.output().unwrap())
+}
+
+/// How many times the approver has run.
+fn prompts(env: &Env) -> usize {
+    read(&env.path("approvals")).lines().count()
+}
+
+#[test]
+fn agent_rules() {
+    // Agent names that cannot be in the real chain above `cargo test` (which may well
+    // run under claude or codex, and rule changes from inside those are refused).
+    let mut env = Env::new("rules");
+    env.backoff = "60";
+    env.start(current_uid());
+    assert_eq!(env.client(&["set", "github"], b"tok").0, 0);
+    assert_eq!(env.client(&["set", "stripe"], b"sk").0, 0);
+
+    // No rules: prompts exactly like today.
+    let before = prompts(&env);
+    assert_eq!(run_as(&env, &["alpha"], "get github").1, "tok");
+    assert_eq!(prompts(&env), before + 1);
+
+    // Rule changes go through the approver, with the change spelled out.
+    assert_eq!(env.client(&["allow", "alpha", "github"], b""), (0, String::new(), "rule: allow alpha github\n".into()));
+    assert_eq!(prompts(&env), before + 2);
+    let approvals = read(&env.path("approvals"));
+    assert!(approvals.contains("dev.agent-keychain.rule alpha:github agent-keychain"), "{approvals}");
+    assert!(approvals.contains("change=allow \"alpha\" to get \"github\" without asking"), "{approvals}");
+    assert_eq!(fs::metadata(env.path("state/rules")).unwrap().permissions().mode() & 0o777, 0o600);
+    assert!(read(&env.path("state/rules")).contains("\nallow alpha github\n"));
+    assert_eq!(env.client(&["allow", "alpha", "github"], b"").0, 0, "unchanged");
+    assert_eq!(prompts(&env), before + 2, "no prompt when nothing changes");
+
+    // Allow: returned without calling the approver. Other secrets and callers still ask.
+    let before = prompts(&env);
+    assert_eq!(run_as(&env, &["alpha"], "get github"), (0, "tok".into(), String::new()));
+    assert_eq!(run_as(&env, &["shx", "alpha", "shy"], "get github").1, "tok", "alpha higher up the chain");
+    assert_eq!(prompts(&env), before);
+    assert_eq!(run_as(&env, &["alpha"], "get stripe").1, "sk");
+    assert_eq!(prompts(&env), before + 1);
+    assert_eq!(env.client(&["get", "github"], b"").1, "tok");
+    assert_eq!(prompts(&env), before + 2);
+
+    // Deny: refused without calling the approver, exit 2, and no backoff after it.
+    assert_eq!(env.client(&["deny", "beta", "*"], b"").0, 0);
+    assert!(read(&env.path("approvals")).contains("change=refuse \"beta\" every secret without asking"));
+    let before = prompts(&env);
+    let (code, out, err) = run_as(&env, &["beta"], "get github");
+    assert_eq!((code, out.as_str()), (2, ""), "{err}");
+    assert_eq!(prompts(&env), before, "approver must not run");
+    assert_eq!(env.client(&["get", "stripe"], b"").1, "sk", "a rule deny starts no backoff");
+    assert_eq!(prompts(&env), before + 1);
+
+    // Deny wins anywhere in the chain.
+    let before = prompts(&env);
+    assert_eq!(run_as(&env, &["alpha", "beta"], "get github").0, 2, "beta under alpha");
+    assert_eq!(run_as(&env, &["beta", "alpha"], "get github").0, 2, "alpha under beta");
+    assert_eq!(prompts(&env), before);
+
+    // The nearest agent with a rule is judged: gamma under alpha is gamma, not alpha.
+    assert_eq!(env.client(&["allow", "gamma", "stripe"], b"").0, 0);
+    let before = prompts(&env);
+    assert_eq!(run_as(&env, &["alpha", "gamma"], "get stripe").1, "sk");
+    assert_eq!(prompts(&env), before, "gamma's own allow");
+    assert_eq!(run_as(&env, &["alpha", "gamma"], "get github").1, "tok");
+    assert_eq!(prompts(&env), before + 1, "gamma has no allow for github, so it asks");
+
+    // Rule changes are refused outright from inside an agent with a rule, or the one named.
+    let before = prompts(&env);
+    for (chain, args) in [(&["alpha"][..], "allow alpha stripe"), (&["shx", "alpha"], "unallow beta '*'"),
+        (&["delta"], "allow delta github")] {
+        let (code, _, err) = run_as(&env, chain, args);
+        assert_eq!(code, 1, "{chain:?}: {args}");
+        assert!(err.contains("is in the asking chain"), "{err}");
+    }
+    assert_eq!(prompts(&env), before, "no prompt for a refused change");
+
+    // Listing never prompts; removing does.
+    assert_eq!(env.client(&["rules"], b"").1, "allow alpha github\ndeny beta *\nallow gamma stripe\n");
+    let (_, json, _) = env.client(&["rules", "--json"], b"");
+    assert!(json.starts_with("[{\"effect\":\"allow\",\"agent\":\"alpha\",\"secret\":\"github\"},"), "{json}");
+    assert_eq!(prompts(&env), before);
+    assert_eq!(env.client(&["unallow", "beta", "*", "--json"], b"").1,
+        "{\"removed\":{\"agent\":\"beta\",\"secret\":\"*\"}}\n");
+    assert!(read(&env.path("approvals")).contains("change=remove the rule \"deny beta *\""));
+    let (code, _, err) = env.client(&["unallow", "beta", "*"], b"");
+    assert_eq!(code, 1);
+    assert!(err.contains("no rule for beta"), "{err}");
+
+    // A denied rule change changes nothing.
+    fs::write(env.path("deny"), "").unwrap();
+    assert_eq!(env.client(&["deny", "alpha", "github"], b"").0, 2);
+    fs::remove_file(env.path("deny")).unwrap();
+    assert!(read(&env.path("state/rules")).contains("\nallow alpha github\n"));
+
+    // Rules survive a restart.
+    env.stop();
+    env.start(current_uid());
+    let before = prompts(&env);
+    assert_eq!(run_as(&env, &["alpha"], "get github").1, "tok");
+    assert_eq!(prompts(&env), before);
+
+    // Bad input never reaches the daemon.
+    for bad in [&["allow", "alpha", "*"][..], &["allow", "agent-keychain", "github"], &["deny", "a b", "github"],
+        &["allow", "abcdefghijklmnop", "github"], &["deny", "alpha", "Bad"]] {
+        assert_eq!(env.client(bad, b"").0, 1, "{bad:?}");
+    }
+    assert_eq!(env.client(&["allow", "alpha"], b"").0, 64);
+
+    let log = read(&env.path("state/log"));
+    for want in ["RULE-ALLOW alpha:github", "RULE-DENY beta:*", "RULE-RM beta:*", "allowed-by-rule",
+        "denied-by-rule", "changed", "unchanged", "RULES - "] {
+        assert!(log.contains(want), "log lacks {want:?}:\n{log}");
+    }
+    assert!(!log.contains("tok") && !log.contains(" sk"), "never values");
+}
+
+#[test]
+fn rule_deny_skips_backoff_but_prompt_deny_does_not() {
+    let mut env = Env::new("rulebackoff");
+    env.backoff = "60";
+    env.start(current_uid());
+    assert_eq!(env.client(&["set", "github"], b"tok").0, 0);
+    assert_eq!(env.client(&["deny", "beta", "github"], b"").0, 0);
+    for _ in 0..3 {
+        assert_eq!(run_as(&env, &["beta"], "get github").0, 2);
+    }
+    let before = read(&env.path("approvals")).lines().count();
+    assert_eq!(env.client(&["get", "github"], b"").1, "tok", "not throttled");
+    assert_eq!(read(&env.path("approvals")).lines().count(), before + 1);
+    assert!(!read(&env.path("state/log")).contains("throttled"));
+
+    // A malformed rules file stops the daemon with the line, instead of serving without it.
+    env.stop();
+    fs::write(env.path("state/rules"), "allow alpha github\nallow alpha *\n").unwrap();
+    let out = env.daemon_cmd(current_uid()).output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("rules: line 2"));
 }
 
 #[test]

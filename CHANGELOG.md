@@ -2,6 +2,13 @@
 - Add agent-browser login plugin (credential.read, agent never sees password)
 - Add Mac support (Authorization Services, launchd, Keychain, libproc, LOCAL_PEERCRED/audit token, getentropy, PT_DENY_ATTACH, macOS struct layouts in sys.rs)
 
+0.28.0
+
+  Add agent rules
+  Add allow, deny
+  Add unallow, rules
+  Add rule polkit action
+
 0.27.0
 
   Match repo description

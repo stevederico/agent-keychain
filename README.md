@@ -1,13 +1,15 @@
 # agent-keychain
 
-Secret store for agents. **Runs local, no dependencies. 3.5K LOC.**
+Secret store for agents. **Runs local, no dependencies. 4.3K LOC.**
 
 An agent gets a secret only after you approve that one request with your login password.
+
+You control which agents get access: `allow claude github` skips the prompt for one agent and one secret, `deny codex '*'` refuses an agent everything.
 
 - Linux only (built for Omarchy)
 - No account, no cloud, no sync
 - Zero-crate Rust: no dependencies, std only (`[dependencies]` is empty)
-- About 3.5K lines of Rust, tests included: small enough to read in an afternoon
+- About 4.3K lines of Rust, tests included: small enough to read in an afternoon
 
 ## How it works
 
@@ -49,11 +51,51 @@ agent-keychain scan              # optional: find keys in plain files (.env, ~/.
 agent-keychain import ~/.npmrc:5 ~/proj/.env:2=github   # optional: store what scan found, one approval
 agent-keychain import --all      # optional: store everything scan finds
 agent-keychain with github,npm --for 2h -- claude   # ask once, then no prompts for these
+agent-keychain allow claude github   # claude gets github with no prompt, needs approval
+agent-keychain deny codex '*'        # codex is refused everything with no prompt, needs approval
+agent-keychain unallow claude github # remove that rule, needs approval
+agent-keychain rules                 # list rules (--json for scripts)
 
 GITHUB_TOKEN=$(agent-keychain get github) gh pr list
 ```
 
 Exit codes: 0 ok, 1 error, 2 denied, 64 usage. Add `--json` for JSON output and JSON errors (`{"error": ..., "code": ...}`); `get` always prints the raw value.
+
+## You control which agents get access
+
+Rules, per agent and per secret. Each change asks for your login password, like `set`.
+
+```
+agent-keychain allow claude github   # claude gets github, no prompt
+agent-keychain deny codex '*'        # codex gets nothing, no prompt (exit 2)
+agent-keychain unallow codex '*'     # back to prompting
+agent-keychain rules                 # allow claude github
+```
+
+- Matching `allow`: the secret comes back with no prompt. Logged as `allowed-by-rule`
+- Matching `deny`: refused with no prompt, exit 2, as if you had denied it. Logged as `denied-by-rule`. It does not start the denial backoff
+- No rule: the usual prompt
+- `with` grants work as before; a deny rule still wins over them
+- `allow` takes one secret name. `*` (all secrets) is only for `deny`, so a spoofed name can never reach the whole vault
+- Kept in `/var/lib/agent-keychain/rules`, owned by the daemon user, mode 0600. Agents running as you cannot edit it
+
+**How the agent is identified**
+
+- The daemon walks up the asking process's parents, from the kernel's parent links, pinned by start time (the same check `with` uses)
+- Each process is named by `/proc/<pid>/comm`, matched exactly (up to 15 characters). The `agent-keychain` client itself is skipped. `agent-keychain log` shows the names it sees
+- Deny wins: a deny rule for any process in the chain refuses
+- Otherwise the agent is the nearest process that has any rule. Only its own `allow` skips the prompt. So `codex` started from `claude` is judged as `codex`, not given what `claude` is allowed
+
+**Agents cannot change their own rules**
+
+- `allow`, `deny` and `unallow` are refused outright, with no prompt, when run from inside the agent the rule names, or from inside any process that has a rule. Run them from a plain terminal
+- The prompt names the change: `"agent-keychain <- zsh" wants to allow "claude" to get "github" without asking`
+
+**The honest caveat: names are not proof**
+
+- A process picks its own name. `allow claude github` trusts that name: any program running as you can call itself `claude` and get `github` with no prompt
+- `deny` never makes anything weaker than before: a program that renames itself to dodge a deny just gets the prompt
+- Only `allow` secrets you would hand to any program running as you without asking
 
 ## Compared to other tools
 
@@ -61,7 +103,7 @@ As of November 2026. Checked against each project's docs and announcements (sour
 
 | Tool | Approval | Agent holds the secret | Where secrets live | Status |
 | --- | --- | --- | --- | --- |
-| **agent-keychain** | Every request, or once per program with `with`; login password; prompt names the secrets and caller | Yes | This machine only | New, Linux only |
+| **agent-keychain** | Every request, or once per program with `with`, or per-agent `allow`/`deny` rules you set; login password; prompt names the secrets and caller | Yes | This machine only | New, Linux only |
 | 1Password CLI (`op`, desktop app integration) | Once per terminal session, then a session that refreshes on use | Yes | 1Password cloud, synced | Mature, paid |
 | Bitwarden CLI (`bw`) and Bitwarden MCP server | One unlock; the session key then opens the whole vault | Yes | Bitwarden cloud or self-hosted | Mature |
 | Bitwarden Agent Access SDK | Per request, human in the loop, end-to-end encrypted | Yes, just in time | Bitwarden vault | Early alpha, not for production |
@@ -76,6 +118,7 @@ As of November 2026. Checked against each project's docs and announcements (sour
 - Agents running as you cannot read the vault, unlike gnome-keyring
 - One prompt at a time, and backoff after a denial, so an agent cannot wear you down
 - `agent-keychain with` skips prompts only for the program you started, for the secrets and time you approved. Other agents still get asked
+- Per-agent rules: allow one agent one secret, or deny an agent everything. Changing a rule needs your password, and an agent cannot ask to allow itself
 - Nothing leaves the machine; no account
 
 **Where it is weaker**
@@ -84,6 +127,7 @@ As of November 2026. Checked against each project's docs and announcements (sour
 - No sync, sharing, phone or browser autofill
 - Secrets handed to one agent can be read by other agents running as you, through `/proc`. Run agents in their own sandbox (Claude Code and Codex have one) to close that
 - Linux and polkit only
+- Agent rules go by process name, which the process chooses. `allow claude github` lets any program running as you that calls itself `claude` get `github` without a prompt. `deny` is safe: a renamed program falls back to the prompt
 - The crypto is a faithful port of libsodium, but the port itself has not been audited
 - Young code with no outside users yet
 

@@ -4,6 +4,7 @@
 use agent_keychain::crypto::{Key, SecretBytes, random};
 use agent_keychain::peer::{self, Peer};
 use agent_keychain::proto::{self, Request};
+use agent_keychain::rules::{self, Decision, Effect, Rules};
 use agent_keychain::vault::Vault;
 use agent_keychain::{sys, time};
 use std::env;
@@ -29,6 +30,7 @@ const PKCHECK: &str = "/usr/bin/pkcheck";
 const ACTION_READ: &str = "dev.agent-keychain.read";
 const ACTION_WRITE: &str = "dev.agent-keychain.write";
 const ACTION_ALLOW: &str = "dev.agent-keychain.allow";
+const ACTION_RULE: &str = "dev.agent-keychain.rule";
 const LOG_TAIL: usize = 50;
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_BACKOFF_SECS: u64 = 30;
@@ -50,7 +52,8 @@ struct Config {
     state_dir: PathBuf,
     key_file: Option<PathBuf>,
     owner_uid: u32,
-    /// Test hook: a program run as `PROGRAM <action> <name> <caller>`. Exit codes as
+    /// Test hook: a program run as `PROGRAM <action> <name> <caller> [key=value...]`,
+    /// the trailing pairs being the details polkit would get. Exit codes as
     /// pkcheck: 0 approves, 1 or 3 denies, anything else is an error.
     /// Without it, approval goes through polkit.
     approver: Option<PathBuf>,
@@ -123,6 +126,7 @@ fn run() -> Result<(), String> {
     let key = load_key(&cfg)?;
     fs::create_dir_all(&cfg.state_dir).map_err(|e| format!("{}: {e}", cfg.state_dir.display()))?;
     let vault = Vault::open(cfg.state_dir.join("vault"), key).map_err(|e| format!("vault: {e}"))?;
+    let rules = Rules::open(cfg.state_dir.join("rules")).map_err(|e| format!("rules: {e}"))?;
     let log = OpenOptions::new()
         .append(true)
         .create(true)
@@ -145,6 +149,7 @@ fn run() -> Result<(), String> {
         prompt: Mutex::new(()),
         backoff: Mutex::new(Backoff::default()),
         grants: Mutex::new(HashMap::new()),
+        rules: Mutex::new(rules),
     });
     for conn in listener.incoming() {
         match conn {
@@ -198,6 +203,8 @@ struct Shared {
     backoff: Mutex<Backoff>,
     /// ALLOW grants, keyed by the granted process's (pid, start time).
     grants: Mutex<HashMap<(i32, u64), Grant>>,
+    /// Per-agent allow and deny rules, saved in `<state-dir>/rules`.
+    rules: Mutex<Rules>,
 }
 
 /// Secrets a process and its descendants may `get` without a prompt, until a deadline.
@@ -255,7 +262,7 @@ fn serve(sh: &Shared, stream: &UnixStream) -> io::Result<()> {
     };
     // Log even when the reply could not be sent: the outcome happened either way.
     let (outcome, sent) = respond(sh, &req, &peer, &caller, stream.as_raw_fd(), &mut w);
-    record(sh, req.verb(), req.name().unwrap_or("-"), &peer, &caller, outcome);
+    record(sh, req.verb(), &req.log_name(), &peer, &caller, outcome);
     sent
 }
 
@@ -274,20 +281,31 @@ fn respond(sh: &Shared, req: &Request, peer: &Peer, caller: &str, sock: RawFd, w
             if !lock(&sh.vault).contains(name) {
                 return missing(w, name);
             }
-            let by_grant = granted(sh, sock, peer.pid, name);
-            if !by_grant && let Some(refused) = gate(sh, ACTION_READ, name, "", caller, peer, w) {
-                return refused;
+            // A deny rule refuses without a prompt, and without starting the backoff:
+            // nobody was asked, so nobody was worn down.
+            let decision = rule_decision(sh, sock, peer.pid, name);
+            if let Decision::Deny(_) = decision {
+                return ("denied-by-rule", proto::write_denied(w));
             }
+            let outcome = if let Decision::Allow(_) = decision {
+                "allowed-by-rule"
+            } else if granted(sh, sock, peer.pid, name) {
+                "allowed-by-grant"
+            } else if let Some(refused) = gate(sh, ACTION_READ, name, &[], caller, peer, w) {
+                return refused;
+            } else {
+                "allowed"
+            };
             // Read after approval: the value may have changed while the prompt was up.
             let value = lock(&sh.vault).get(name);
             match value {
-                Ok(Some(v)) => (if by_grant { "allowed-by-grant" } else { "allowed" }, proto::write_ok(w, &v)),
+                Ok(Some(v)) => (outcome, proto::write_ok(w, &v)),
                 Ok(None) => missing(w, name),
                 Err(e) => ("error", proto::write_err(w, &format!("cannot open {name}: {e}"))),
             }
         }
         Request::Set(name, value) => {
-            if let Some(refused) = gate(sh, ACTION_WRITE, name, "", caller, peer, w) {
+            if let Some(refused) = gate(sh, ACTION_WRITE, name, &[], caller, peer, w) {
                 return refused;
             }
             let saved = lock(&sh.vault).set(name, value);
@@ -300,7 +318,7 @@ fn respond(sh: &Shared, req: &Request, peer: &Peer, caller: &str, sock: RawFd, w
             if !lock(&sh.vault).contains(name) {
                 return missing(w, name);
             }
-            if let Some(refused) = gate(sh, ACTION_WRITE, name, "", caller, peer, w) {
+            if let Some(refused) = gate(sh, ACTION_WRITE, name, &[], caller, peer, w) {
                 return refused;
             }
             let removed = lock(&sh.vault).remove(name);
@@ -312,7 +330,7 @@ fn respond(sh: &Shared, req: &Request, peer: &Peer, caller: &str, sock: RawFd, w
             }
         }
         Request::SetMany(list, items) => {
-            if let Some(refused) = gate(sh, ACTION_WRITE, list, "", caller, peer, w) {
+            if let Some(refused) = gate(sh, ACTION_WRITE, list, &[], caller, peer, w) {
                 return refused;
             }
             let pairs: Vec<(&str, &[u8])> = items.iter().map(|(n, v)| (n.as_str(), &v[..])).collect();
@@ -333,7 +351,8 @@ fn respond(sh: &Shared, req: &Request, peer: &Peer, caller: &str, sock: RawFd, w
             let Some(chain) = verified_ancestry(sock, peer.pid) else {
                 return ("error", proto::write_err(w, "cannot identify the asking process"));
             };
-            if let Some(refused) = gate(sh, ACTION_ALLOW, list, &duration(*secs), caller, peer, w) {
+            let details = [("duration", duration(*secs))];
+            if let Some(refused) = gate(sh, ACTION_ALLOW, list, &details, caller, peer, w) {
                 return refused;
             }
             let names = list.split(',').map(str::to_string).collect();
@@ -341,7 +360,92 @@ fn respond(sh: &Shared, req: &Request, peer: &Peer, caller: &str, sock: RawFd, w
             lock(&sh.grants).insert(chain[0], Grant { names, until });
             ("approved", proto::write_ok(w, b""))
         }
+        Request::Rules => {
+            let text = rules::format(lock(&sh.rules).list());
+            ("listed", proto::write_ok(w, text.trim_end().as_bytes()))
+        }
+        Request::Rule(rule) => {
+            if lock(&sh.rules).has(rule) {
+                return ("unchanged", proto::write_ok(w, b""));
+            }
+            let (agent, secret) = (&rule.agent, &rule.secret);
+            let change = match (rule.effect, secret.as_str()) {
+                (Effect::Allow, _) => format!("allow \"{agent}\" to get \"{secret}\" without asking"),
+                (Effect::Deny, rules::ALL) => format!("refuse \"{agent}\" every secret without asking"),
+                (Effect::Deny, _) => format!("refuse \"{agent}\" the secret \"{secret}\" without asking"),
+            };
+            change_rules(sh, req, agent, change, caller, peer, sock, w, |r| r.put(rule.clone()).map(|()| true))
+        }
+        Request::Unrule(agent, secret) => {
+            let found = lock(&sh.rules).list().iter().find(|r| r.agent == *agent && r.secret == *secret).cloned();
+            let Some(rule) = found else {
+                return ("missing", proto::write_err(w, &format!("no rule for {agent} and {secret}")));
+            };
+            let change = format!("remove the rule \"{} {agent} {secret}\"", rule.effect.as_str());
+            change_rules(sh, req, agent, change, caller, peer, sock, w, |r| r.remove(agent, secret))
+        }
     }
+}
+
+/// What the rules say about this request. Ask when there are no rules, or when the
+/// asking chain cannot be read reliably: falling back to the prompt is never weaker.
+fn rule_decision(sh: &Shared, sock: RawFd, pid: i32, name: &str) -> Decision {
+    if lock(&sh.rules).list().is_empty() {
+        return Decision::Ask;
+    }
+    let Some(chain) = agent_chain(sock, pid) else { return Decision::Ask };
+    rules::decide(lock(&sh.rules).list(), &chain, name)
+}
+
+/// Adds, replaces or removes a rule after the user approves. Refused without a prompt
+/// when the asking chain holds the agent the rule is about, or any agent that has a rule,
+/// so an agent cannot ask to allow itself. `apply` returns false when there was nothing
+/// to remove (another request removed it while the prompt was up).
+#[allow(clippy::too_many_arguments)]
+fn change_rules(
+    sh: &Shared,
+    req: &Request,
+    agent: &str,
+    change: String,
+    caller: &str,
+    peer: &Peer,
+    sock: RawFd,
+    w: &mut impl Write,
+    apply: impl FnOnce(&mut Rules) -> io::Result<bool>,
+) -> Reply {
+    let Some(chain) = agent_chain(sock, peer.pid) else {
+        return ("error", proto::write_err(w, "cannot identify the asking process"));
+    };
+    let blocked = rules::blocks_change(lock(&sh.rules).list(), &chain, Some(agent)).map(str::to_string);
+    if let Some(name) = blocked {
+        let msg = format!("\"{name}\" is in the asking chain; change rules from a terminal outside any agent");
+        return ("refused", proto::write_err(w, &msg));
+    }
+    if let Some(refused) = gate(sh, ACTION_RULE, &req.log_name(), &[("change", change)], caller, peer, w) {
+        return refused;
+    }
+    let applied = apply(&mut lock(&sh.rules));
+    match applied {
+        Ok(true) => ("changed", proto::write_ok(w, b"")),
+        Ok(false) => ("missing", proto::write_err(w, "no such rule")),
+        Err(e) => ("error", proto::write_err(w, &format!("cannot save rules: {e}"))),
+    }
+}
+
+/// Process names (`/proc/<pid>/comm`) up the asking chain, nearest first, leaving out
+/// the agent-keychain client itself. The names are read between two ancestry reads that
+/// must match, with the asker alive, so each name belongs to that (pid, start time).
+/// The names themselves are whatever each process chose to call itself.
+fn agent_chain(sock: RawFd, pid: i32) -> Option<Vec<String>> {
+    let pidfd = peer::peer_pidfd(sock).ok()?;
+    let first = peer::ancestry(pid).ok()?;
+    let names = first.iter().map(|&(p, _)| peer::comm(p)).collect::<io::Result<Vec<_>>>().ok()?;
+    let again = peer::ancestry(pid).ok()?;
+    if first.is_empty() || first != again || !peer::alive(&pidfd) {
+        return None;
+    }
+    let skip = usize::from(names[0] == rules::CLIENT_NAME);
+    Some(names.into_iter().skip(skip).collect())
 }
 
 /// Whether the asking process, or one of its ancestors, holds a live grant for `name`.
@@ -384,7 +488,7 @@ fn gate(
     sh: &Shared,
     action: &str,
     name: &str,
-    duration: &str,
+    details: &[(&str, String)],
     caller: &str,
     peer: &Peer,
     w: &mut impl Write,
@@ -401,7 +505,7 @@ fn gate(
             return Some(("busy", proto::write_err(w, msg)));
         }
     };
-    match ask(sh, action, name, duration, caller, peer) {
+    match ask(sh, action, name, details, caller, peer) {
         Ok(true) => {
             lock(&sh.backoff).approved();
             None
@@ -418,18 +522,22 @@ fn gate(
 }
 
 /// Ok(true) approved, Ok(false) denied, Err when no decision could be made.
-fn ask(sh: &Shared, action: &str, name: &str, duration: &str, caller: &str, peer: &Peer) -> io::Result<bool> {
+fn ask(sh: &Shared, action: &str, name: &str, details: &[(&str, String)], caller: &str, peer: &Peer) -> io::Result<bool> {
     let (program, status) = match &sh.cfg.approver {
         Some(program) => (
             program.display().to_string(),
-            Command::new(program).args([action, name, caller]).stdin(Stdio::null()).status()?,
+            Command::new(program)
+                .args([action, name, caller])
+                .args(details.iter().map(|(k, v)| format!("{k}={v}")))
+                .stdin(Stdio::null())
+                .status()?,
         ),
         None => {
             // pid + start time + uid pins the subject, so a reused pid cannot inherit the answer.
             let (_, start) = peer::proc_stat(peer.pid)?;
             let mut pkcheck = Command::new(PKCHECK);
-            if !duration.is_empty() {
-                pkcheck.args(["--detail", "duration", duration]);
+            for (k, v) in details {
+                pkcheck.args(["--detail", k, v]);
             }
             let status = pkcheck
                 .args(["--action-id", action])

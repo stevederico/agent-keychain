@@ -3,6 +3,7 @@
 use agent_keychain::crypto::{SecretBytes, wipe};
 use agent_keychain::names::valid_name;
 use agent_keychain::proto::{self, MAX_SECRET, Request, Response};
+use agent_keychain::rules::{self, Effect, Rule};
 use agent_keychain::scan;
 use agent_keychain::sys;
 use std::env;
@@ -35,6 +36,13 @@ commands:
   list                list secret names
   log                 show recent requests
   with <names> <cmd>  run a program that may get these secrets without asking, for a while
+  allow <agent> <name>
+                      let an agent get a secret without asking (asks you to approve)
+  deny <agent> <name|'*'>
+                      refuse an agent a secret, or all, without asking (asks you to approve)
+  unallow <agent> <name|'*'>
+                      remove that allow or deny rule (asks you to approve)
+  rules               list allow and deny rules
   scan [dir]          find secrets in plain files; never prints them
   import <file>:<line>...
                       store secrets that scan found, under one approval
@@ -43,7 +51,8 @@ commands:
   help <command>      details for one command
   --version           print the version
 
---json: JSON output for list, log, scan, doctor, set, rm, import and --version,
+--json: JSON output for list, log, rules, scan, doctor, set, rm, import, allow,
+deny, unallow and --version,
 and errors as {\"error\": ..., \"code\": ...}. get always prints the raw value.
 
 example:
@@ -85,6 +94,36 @@ without a prompt until the time is up (default 1h, at most 12h: 90s, 30m, 2h) or
 Other secrets and other programs still ask.
 
   agent-keychain with github,npm --for 2h -- claude"),
+    ("allow", "usage: agent-keychain allow <agent> <name> [--json]
+
+Lets the agent get this secret with no prompt, from now on. Asks you to approve the
+change. The agent is a process name, as `agent-keychain log` shows it in the caller
+chain (claude, codex): exact match, 1 to 15 of A-Z, a-z, 0-9, '.', '_', '-'.
+
+The agent judged is the nearest process up the chain that has any rule, so codex run
+from claude is codex, not claude. Any deny rule in the chain wins. No rule: a prompt,
+as always. allow takes one secret name; '*' is only for deny.
+
+A process picks its own name, so allow trusts it: a program running as you could call
+itself claude. Rule changes are refused outright when run from inside an agent that
+has a rule, or the agent named.
+
+  agent-keychain allow claude github"),
+    ("deny", "usage: agent-keychain deny <agent> <name|'*'> [--json]
+
+Refuses the agent this secret, or every secret with '*', with no prompt: exit 2, as if
+you had denied it. A rule deny never starts the denial backoff. If any process in the
+asking chain has a matching deny rule, the request is refused. Asks you to approve the
+change. A program that renames itself to dodge a deny just gets the prompt again.
+
+  agent-keychain deny codex '*'"),
+    ("unallow", "usage: agent-keychain unallow <agent> <name|'*'> [--json]
+
+Removes the allow or deny rule for this agent and secret. Asks you to approve."),
+    ("rules", "usage: agent-keychain rules [--json]
+
+Lists allow and deny rules, one per line: allow claude github. Never prompts.
+--json gives an array of {\"effect\", \"agent\", \"secret\"}."),
     ("scan", "usage: agent-keychain scan [dir...] [--json]
 
 Finds secrets in plain files: .env files, shell config, ~/.npmrc, ~/.aws/credentials,
@@ -191,6 +230,14 @@ fn run() -> Result<ExitCode, String> {
         ["log"] => Request::Log,
         ["get", n] => Request::Get(name(n)?),
         ["rm", n] => Request::Rm(name(n)?),
+        ["rules"] => Request::Rules,
+        ["allow", a, s] => Request::Rule(Rule::new(Effect::Allow, a, s)?),
+        ["deny", a, s] => Request::Rule(Rule::new(Effect::Deny, a, s)?),
+        ["unallow", a, s] => {
+            // Same checks as a new rule, but '*' is fine for either kind.
+            Rule::new(Effect::Deny, a, s)?;
+            Request::Unrule(a.to_string(), s.to_string())
+        }
         ["set", n] => {
             let n = name(n)?;
             let value = read_secret(&n)?;
@@ -280,7 +327,7 @@ fn doctor() -> ExitCode {
 
     let policy = fs::read_to_string("/usr/share/polkit-1/actions/dev.agent-keychain.policy");
     checks.push(match policy {
-        Ok(p) if p.contains("dev.agent-keychain.allow") => ("polkit policy", true, "installed".into()),
+        Ok(p) if p.contains("dev.agent-keychain.rule") => ("polkit policy", true, "installed".into()),
         Ok(_) => ("polkit policy", false, "outdated: rerun ./install.sh".into()),
         Err(e) => ("polkit policy", false, format!("missing ({e}): run ./install.sh")),
     });
@@ -377,6 +424,14 @@ fn print_ok(req: &Request, data: &[u8]) -> io::Result<()> {
             Request::Set(n, _) | Request::SetMany(n, _) => writeln!(out, "{{\"stored\":[{}]}}", list(n))?,
             Request::Rm(n) => writeln!(out, "{{\"removed\":{}}}", json_string(n))?,
             Request::Version => writeln!(out, "{{\"version\":{}}}", json_string(&text))?,
+            Request::Rules => {
+                let rules = rules::parse(&text).map_err(io::Error::other)?;
+                writeln!(out, "[{}]", rules.iter().map(rule_json).collect::<Vec<_>>().join(","))?
+            }
+            Request::Rule(r) => writeln!(out, "{{\"added\":{}}}", rule_json(r))?,
+            Request::Unrule(a, s) => {
+                writeln!(out, "{{\"removed\":{{\"agent\":{},\"secret\":{}}}}}", json_string(a), json_string(s))?
+            }
             Request::Get(_) | Request::Allow(..) => {}
         }
         return out.flush();
@@ -388,7 +443,7 @@ fn print_ok(req: &Request, data: &[u8]) -> io::Result<()> {
                 out.write_all(b"\n")?;
             }
         }
-        Request::List | Request::Log | Request::Version => {
+        Request::List | Request::Log | Request::Version | Request::Rules => {
             out.write_all(data)?;
             if !data.is_empty() {
                 out.write_all(b"\n")?;
@@ -401,6 +456,8 @@ fn print_ok(req: &Request, data: &[u8]) -> io::Result<()> {
             }
         }
         Request::Rm(n) => eprintln!("removed {n}"),
+        Request::Rule(r) => eprintln!("rule: {} {} {}", r.effect.as_str(), r.agent, r.secret),
+        Request::Unrule(a, s) => eprintln!("removed the rule for {a} {s}"),
         Request::Allow(..) => {}
     }
     out.flush()
@@ -547,6 +604,15 @@ fn store_request(mut items: Vec<(String, scan::Finding)>, rename: bool) -> Resul
     }
     let list = items.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(",");
     Ok(Request::SetMany(list, items))
+}
+
+fn rule_json(r: &Rule) -> String {
+    format!(
+        "{{\"effect\":{},\"agent\":{},\"secret\":{}}}",
+        json_string(r.effect.as_str()),
+        json_string(&r.agent),
+        json_string(&r.secret)
+    )
 }
 
 fn json_string(s: &str) -> String {

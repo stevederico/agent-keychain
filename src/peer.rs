@@ -83,6 +83,14 @@ pub fn proc_stat(pid: i32) -> io::Result<(i32, u64)> {
     Ok((ppid, start))
 }
 
+/// The process's name as the kernel keeps it (`/proc/<pid>/comm`, at most 15 bytes).
+/// The process chose it, so it identifies a program only as far as that program is honest.
+pub fn comm(pid: i32) -> io::Result<String> {
+    let raw = fs::read(format!("/proc/{pid}/comm"))?;
+    let raw = raw.strip_suffix(b"\n").unwrap_or(&raw);
+    Ok(String::from_utf8_lossy(raw).into_owned())
+}
+
 /// A best-effort "client <- parent <- grandparent" chain of command names.
 /// Processes choose their own names, so this is a hint for the user, not proof.
 pub fn describe_caller(pid: i32) -> String {
@@ -120,6 +128,8 @@ mod tests {
         let (ppid, start) = proc_stat(me).unwrap();
         assert!(ppid > 0 && start > 0);
         assert!(!describe_caller(me).is_empty());
+        let name = comm(me).unwrap();
+        assert!(!name.is_empty() && name.len() <= 15 && !name.ends_with('\n'), "{name:?}");
     }
 
     #[test]

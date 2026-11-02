@@ -44,6 +44,15 @@ agent-keychain with github --for 2h -- <your command>
 
 They approve once; you and your child processes then get `github` without prompts until it expires. You cannot set this up yourself without the user approving it.
 
+## Rules the user set
+
+The user may allow or deny agents by process name (`agent-keychain rules` lists them).
+
+- An allow rule for you: `get` returns with no prompt
+- A deny rule: `get` exits 2 at once, with no prompt. Treat it as a denial: stop, do not retry
+- Never run `allow`, `deny` or `unallow`. They need the user's password, and they are refused from inside an agent anyway
+- Never rename your process or run under another agent's name to match a rule
+
 ## Do not
 
 - Do not run `set`, `rm` or `import` unless the user asked you to change secrets
