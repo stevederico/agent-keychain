@@ -94,7 +94,8 @@ Agent use: `GITHUB_TOKEN=$(agent-keychain get github) gh pr list`
 - **Once**: every `get`, `set` and `rm` prompts (polkit `auth_self`), unless an agent rule or a `with` grant decides a `get`. `list` and `log` never show values and don't prompt
 - **Deny**: the client exits 2 and prints nothing
 - Log line: time, request, secret name, uid, pid, caller chain, outcome. Never values
-- Logged: every request, including `list`, `log`, other users' refused connections and malformed requests
+- Logged: every request, including `list`, `log` and malformed requests. Other users' refused connections are logged at most once a minute, so another user cannot fill the disk or push your entries out
+- The log moves to `log.1` at 1 MiB (`--log-max`), replacing the previous `log.1`, so it never takes more than about 2 MiB
 - Outcomes: `allowed`, `allowed-by-grant`, `allowed-by-rule`, `approved` (a `with` grant), `stored`, `removed`, `listed`, `shown`, `denied`, `denied-by-rule`, `changed` (a rule), `unchanged` (that rule already existed), `missing`, `error` (approval could not run), `busy`, `throttled`, `refused`, `malformed`
 - Rule requests log as `RULE-ALLOW`, `RULE-DENY`, `RULE-RM` and `RULES`, with `agent:secret` in the name column
 - **One at a time**: while a prompt is open, other requests that need approval fail at once (`busy`) instead of queueing

@@ -32,12 +32,18 @@ const ACTION_WRITE: &str = "dev.agent-keychain.write";
 const ACTION_ALLOW: &str = "dev.agent-keychain.allow";
 const ACTION_RULE: &str = "dev.agent-keychain.rule";
 const LOG_TAIL: usize = 50;
+/// The log rotates to `log.1` at this size, so it never holds more than about twice it.
+const DEFAULT_LOG_MAX: u64 = 1 << 20;
+/// Other users' refused connections are logged at most this often, so they cannot
+/// fill the disk or push the owner's entries out of the log.
+const FOREIGN_LOG_GAP: Duration = Duration::from_secs(60);
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_BACKOFF_SECS: u64 = 30;
 const MAX_BACKOFF: Duration = Duration::from_secs(600);
 
 const USAGE: &str = "usage: agent-keychaind [--owner-uid UID] [--socket PATH] [--state-dir DIR]
                       [--key-file PATH] [--approver PROGRAM] [--deny-backoff SECS]
+                      [--log-max BYTES]
        agent-keychaind --gen-key   (print 32 random bytes, for systemd-creds)
        agent-keychaind --version
 
@@ -45,7 +51,9 @@ The owner uid may also come from AGENT_KEYCHAIN_OWNER_UID. Without --key-file th
 vault key is read from the systemd credential \"vault-key\".
 
 After a denial, no prompt is shown for --deny-backoff seconds (default 30),
-doubling with each denial in a row, up to 10 minutes.";
+doubling with each denial in a row, up to 10 minutes.
+
+The log moves to log.1 once it reaches --log-max bytes (default 1 MiB).";
 
 struct Config {
     socket: PathBuf,
@@ -58,6 +66,7 @@ struct Config {
     /// Without it, approval goes through polkit.
     approver: Option<PathBuf>,
     deny_backoff: Duration,
+    log_max: u64,
 }
 
 enum Mode {
@@ -73,6 +82,7 @@ fn parse_args() -> Result<Mode, String> {
     let mut approver = None;
     let mut owner = env::var("AGENT_KEYCHAIN_OWNER_UID").ok();
     let mut backoff = DEFAULT_BACKOFF_SECS.to_string();
+    let mut log_max = DEFAULT_LOG_MAX.to_string();
 
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{arg} needs a value\n\n{USAGE}"));
@@ -88,6 +98,7 @@ fn parse_args() -> Result<Mode, String> {
             "--approver" => approver = Some(value()?.into()),
             "--owner-uid" => owner = Some(value()?),
             "--deny-backoff" => backoff = value()?,
+            "--log-max" => log_max = value()?,
             "-h" | "--help" => return Err(USAGE.into()),
             _ => return Err(format!("unknown argument {arg}\n\n{USAGE}")),
         }
@@ -96,7 +107,8 @@ fn parse_args() -> Result<Mode, String> {
     let owner_uid = owner.parse().map_err(|_| format!("bad owner uid {owner:?}"))?;
     let backoff = backoff.parse().map_err(|_| format!("bad --deny-backoff {backoff:?}"))?;
     let deny_backoff = Duration::from_secs(backoff);
-    Ok(Mode::Run(Config { socket, state_dir, key_file, owner_uid, approver, deny_backoff }))
+    let log_max = log_max.parse().map_err(|_| format!("bad --log-max {log_max:?}"))?;
+    Ok(Mode::Run(Config { socket, state_dir, key_file, owner_uid, approver, deny_backoff, log_max }))
 }
 
 fn main() -> ExitCode {
@@ -127,12 +139,7 @@ fn run() -> Result<(), String> {
     fs::create_dir_all(&cfg.state_dir).map_err(|e| format!("{}: {e}", cfg.state_dir.display()))?;
     let vault = Vault::open(cfg.state_dir.join("vault"), key).map_err(|e| format!("vault: {e}"))?;
     let rules = Rules::open(cfg.state_dir.join("rules")).map_err(|e| format!("rules: {e}"))?;
-    let log = OpenOptions::new()
-        .append(true)
-        .create(true)
-        .mode(0o600)
-        .open(cfg.state_dir.join("log"))
-        .map_err(|e| format!("log: {e}"))?;
+    let log = open_log(&cfg.state_dir).map_err(|e| format!("log: {e}"))?;
 
     let _ = fs::remove_file(&cfg.socket);
     let listener = UnixListener::bind(&cfg.socket).map_err(|e| format!("{}: {e}", cfg.socket.display()))?;
@@ -146,6 +153,7 @@ fn run() -> Result<(), String> {
         cfg,
         vault: Mutex::new(vault),
         log: Mutex::new(log),
+        foreign_logged: Mutex::new(None),
         prompt: Mutex::new(()),
         backoff: Mutex::new(Backoff::default()),
         grants: Mutex::new(HashMap::new()),
@@ -197,6 +205,8 @@ struct Shared {
     cfg: Config,
     vault: Mutex<Vault>,
     log: Mutex<File>,
+    /// When another user's refused connection was last logged.
+    foreign_logged: Mutex<Option<Instant>>,
     /// Held while a prompt is open. One at a time, so prompts never stack up and the
     /// user is not left guessing which request a prompt belongs to.
     prompt: Mutex<()>,
@@ -249,7 +259,12 @@ fn serve(sh: &Shared, stream: &UnixStream) -> io::Result<()> {
     let peer = peer::peer_cred(stream.as_raw_fd())?;
     let caller = peer::describe_caller(peer.pid);
     if peer.uid != sh.cfg.owner_uid {
-        record(sh, "CONNECT", "-", &peer, &caller, "refused");
+        let mut last = lock(&sh.foreign_logged);
+        if last.is_none_or(|t| t.elapsed() >= FOREIGN_LOG_GAP) {
+            *last = Some(Instant::now());
+            drop(last);
+            record(sh, "CONNECT", "-", &peer, &caller, "refused");
+        }
         return proto::write_err(&mut w, "this keychain belongs to another user");
     }
 
@@ -275,7 +290,7 @@ fn respond(sh: &Shared, req: &Request, peer: &Peer, caller: &str, sock: RawFd, w
             let names = lock(&sh.vault).names().collect::<Vec<_>>().join("\n");
             ("listed", proto::write_ok(w, names.as_bytes()))
         }
-        Request::Log => ("shown", proto::write_ok(w, &log_tail(&sh.cfg.state_dir.join("log")))),
+        Request::Log => ("shown", proto::write_ok(w, &log_tail(&sh.cfg.state_dir))),
         Request::Version => ("shown", proto::write_ok(w, env!("CARGO_PKG_VERSION").as_bytes())),
         Request::Get(name) => {
             if !lock(&sh.vault).contains(name) {
@@ -592,8 +607,23 @@ fn ask(sh: &Shared, action: &str, name: &str, details: &[(&str, String)], caller
     }
 }
 
-/// The last LOG_TAIL lines, reading only the end of the file.
-fn log_tail(path: &Path) -> Vec<u8> {
+fn open_log(state_dir: &Path) -> io::Result<File> {
+    OpenOptions::new().append(true).create(true).mode(0o600).open(state_dir.join("log"))
+}
+
+/// The last LOG_TAIL lines, from `log.1` too when `log` was just rotated.
+fn log_tail(state_dir: &Path) -> Vec<u8> {
+    let mut lines = tail_lines(&state_dir.join("log"));
+    if lines.len() < LOG_TAIL {
+        let mut older = tail_lines(&state_dir.join("log.1"));
+        older.append(&mut lines);
+        lines = older;
+    }
+    lines[lines.len().saturating_sub(LOG_TAIL)..].join(&b'\n')
+}
+
+/// The last LOG_TAIL lines of one file, reading only its end.
+fn tail_lines(path: &Path) -> Vec<Vec<u8>> {
     const WINDOW: u64 = 64 * 1024;
     let Ok(mut f) = File::open(path) else { return Vec::new() };
     let start = f.metadata().map_or(0, |m| m.len()).saturating_sub(WINDOW);
@@ -607,7 +637,7 @@ fn log_tail(path: &Path) -> Vec<u8> {
         text = text.iter().position(|&b| b == b'\n').map_or(&[][..], |i| &text[i + 1..]);
     }
     let lines: Vec<&[u8]> = text.split(|&b| b == b'\n').filter(|l| !l.is_empty()).collect();
-    lines[lines.len().saturating_sub(LOG_TAIL)..].join(&b'\n')
+    lines[lines.len().saturating_sub(LOG_TAIL)..].iter().map(|l| l.to_vec()).collect()
 }
 
 fn record(sh: &Shared, verb: &str, name: &str, peer: &Peer, caller: &str, outcome: &str) {
@@ -624,5 +654,12 @@ fn record(sh: &Shared, verb: &str, name: &str, peer: &Peer, caller: &str, outcom
     let mut log = lock(&sh.log);
     if let Err(e) = log.write_all(line.as_bytes()) {
         eprintln!("agent-keychaind: log: {e}");
+    }
+    if log.metadata().is_ok_and(|m| m.len() >= sh.cfg.log_max) {
+        let dir = &sh.cfg.state_dir;
+        match fs::rename(dir.join("log"), dir.join("log.1")).and_then(|()| open_log(dir)) {
+            Ok(fresh) => *log = fresh,
+            Err(e) => eprintln!("agent-keychaind: log rotate: {e}"),
+        }
     }
 }

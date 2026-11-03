@@ -20,6 +20,7 @@ struct Env {
     dir: PathBuf,
     daemon: Option<Child>,
     backoff: &'static str,
+    log_max: &'static str,
 }
 
 impl Env {
@@ -38,7 +39,7 @@ impl Env {
         let approver = dir.join("approve.sh");
         fs::write(&approver, script).unwrap();
         fs::set_permissions(&approver, fs::Permissions::from_mode(0o755)).unwrap();
-        Env { dir, daemon: None, backoff: "0" }
+        Env { dir, daemon: None, backoff: "0", log_max: "1048576" }
     }
 
     /// The socket is relative to `dir` (both processes run there) to stay under the
@@ -48,7 +49,7 @@ impl Env {
         c.current_dir(&self.dir)
             .args(["--socket", "sock", "--state-dir", "state", "--key-file", "key"])
             .args(["--owner-uid", &owner.to_string(), "--approver", "./approve.sh"])
-            .args(["--deny-backoff", self.backoff])
+            .args(["--deny-backoff", self.backoff, "--log-max", self.log_max])
             .stdin(Stdio::null())
             .stderr(Stdio::piped());
         c
@@ -528,6 +529,34 @@ fn other_users_are_refused() {
     assert!(!env.path("approvals").exists(), "approver must not run");
     let log = read(&env.path("state/log"));
     assert!(log.contains("CONNECT - ") && log.contains("refused"), "{log}");
+
+    // A flood of refused connections logs one line, not one per connection.
+    for _ in 0..20 {
+        assert_eq!(env.client(&["list"], b"").0, 1);
+    }
+    let log = read(&env.path("state/log"));
+    assert_eq!(log.matches("CONNECT - ").count(), 1, "{log}");
+}
+
+#[test]
+fn log_rotates_at_its_limit() {
+    let mut env = Env::new("rotate");
+    env.log_max = "2000";
+    env.start(current_uid());
+    for _ in 0..60 {
+        assert_eq!(env.client(&["list"], b"").0, 0);
+    }
+    let log = fs::metadata(env.path("state/log")).unwrap().len();
+    let old = fs::metadata(env.path("state/log.1")).unwrap().len();
+    assert!(log < 2000 && old < 2400, "log {log}, log.1 {old}");
+    // `log` still shows a full tail, reaching into log.1 after a rotation.
+    let (code, json, _) = env.client(&["log", "--json"], b"");
+    assert_eq!(code, 0);
+    let lines = |f: &str| read(&env.path(f)).lines().count();
+    let (newer, older) = (lines("state/log"), lines("state/log.1"));
+    assert!(older > 0, "rotated log is empty");
+    // The LOG request is written after its reply, so it is not in it.
+    assert_eq!(json.matches("\"request\"").count(), (newer + older - 1).min(50), "{json}");
 }
 
 #[test]
